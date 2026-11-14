@@ -605,8 +605,12 @@ class ScannerProvider extends ChangeNotifier {
       final double prevAspect = prevW / prevH;
 
       double photoAspect = prevAspect;
+      int? photoW;
+      int? photoH;
       if (jpegInfo != null && jpegInfo.uprightWidth > 0 && jpegInfo.uprightHeight > 0) {
         photoAspect = jpegInfo.uprightAspectRatio;
+        photoW = jpegInfo.uprightWidth;
+        photoH = jpegInfo.uprightHeight;
       } else {
         try {
           final bytes = await File(xFile.path).readAsBytes();
@@ -615,6 +619,8 @@ class ScannerProvider extends ChangeNotifier {
             final oriented = img.bakeOrientation(decoded);
             if (oriented.width > 0 && oriented.height > 0) {
               photoAspect = oriented.width / oriented.height;
+              photoW = oriented.width;
+              photoH = oriented.height;
             }
           }
         } catch (_) {}
@@ -669,6 +675,8 @@ class ScannerProvider extends ChangeNotifier {
         originalImagePath: xFile.path,
         corners: finalCorners,
         autoDetectedCorners: hadDetection ? finalCorners : null,
+        imageWidth: photoW,
+        imageHeight: photoH,
         filterType: 'auto',
       );
 
@@ -712,15 +720,28 @@ class ScannerProvider extends ChangeNotifier {
       for (int i = 0; i < pickedFiles.length; i++) {
         final file = pickedFiles[i];
         DetectionResult? detection;
+        int? docWidth;
+        int? docHeight;
 
         // Apply corner detection for all selected images ONLY if Auto mode was active
         if (shouldRunDetection) {
           try {
-            detection = await _cornerDetector
-                .detectCornersFromPath(file.path)
-                .timeout(const Duration(seconds: 4));
+            detection = await _cornerDetector.detectCornersFromPath(file.path);
+            if (detection.imageWidth != null && detection.imageHeight != null) {
+              docWidth = detection.imageWidth;
+              docHeight = detection.imageHeight;
+            }
           } catch (e) {
-            debugPrint('[DocuRay] Corner detection timed out or failed for ${file.path}: $e');
+            debugPrint('[DocuRay] Corner detection failed for ${file.path}: $e');
+          }
+        }
+
+        // If dimensions were not resolved by detection, read metadata from JPEG or file
+        if (docWidth == null || docHeight == null) {
+          final jpegMeta = await JpegMetadata.fromFile(File(file.path));
+          if (jpegMeta != null && jpegMeta.uprightWidth > 0 && jpegMeta.uprightHeight > 0) {
+            docWidth = jpegMeta.uprightWidth;
+            docHeight = jpegMeta.uprightHeight;
           }
         }
 
@@ -741,6 +762,8 @@ class ScannerProvider extends ChangeNotifier {
             originalImagePath: file.path,
             corners: corners,
             autoDetectedCorners: hasValidDoc ? corners : null,
+            imageWidth: docWidth,
+            imageHeight: docHeight,
             filterType: 'auto',
           ),
         );

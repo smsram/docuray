@@ -17,6 +17,8 @@ class DetectionResult {
   final bool isTightlyFramed;
   final double areaRatio;
   final Map<String, dynamic>? metrics;
+  final int? imageWidth;
+  final int? imageHeight;
 
   const DetectionResult({
     required this.corners,
@@ -25,6 +27,8 @@ class DetectionResult {
     this.isTightlyFramed = false,
     this.areaRatio = 0.0,
     this.metrics,
+    this.imageWidth,
+    this.imageHeight,
   });
 
   static const defaultResult = DetectionResult(
@@ -54,7 +58,7 @@ class PaperCornerDetector {
   SendPort? _workerSendPort;
   bool _isInitialized = false;
   bool _isInitializing = false;
-  DateTime? _lastInitAttempt;
+  Completer<void>? _initCompleter;
 
   // Temporal stabilization on main isolate
   List<CornerPoint>? _stabilizedCorners;
@@ -64,14 +68,14 @@ class PaperCornerDetector {
   int get consecutiveStableFrames => _consecutiveStableFrames;
 
   Future<void> initialize() async {
-    if (_isInitialized || _isInitializing) return;
-
-    // Throttle failed initialization attempts to avoid blocking main thread with asset loads
-    if (_lastInitAttempt != null && DateTime.now().difference(_lastInitAttempt!).inSeconds < 2) {
+    if (_isInitialized) return;
+    if (_isInitializing) {
+      await _initCompleter?.future;
       return;
     }
-    _lastInitAttempt = DateTime.now();
+
     _isInitializing = true;
+    _initCompleter = Completer<void>();
 
     try {
       // Load raw model bytes on main isolate so background isolate doesn't need platform channels
@@ -96,6 +100,8 @@ class PaperCornerDetector {
       _isInitialized = false;
     } finally {
       _isInitializing = false;
+      _initCompleter?.complete();
+      _initCompleter = null;
     }
   }
 
@@ -161,40 +167,19 @@ class PaperCornerDetector {
   }
 
   Future<DetectionResult> detectCornersFromPath(String path) async {
-    try {
-      // Decode, bake EXIF orientation, and downscale in background isolate to prevent ANR freeze
-      final rgbData = await Isolate.run(() async {
-        final bytes = await File(path).readAsBytes();
-        final decoded = img.decodeImage(bytes);
-        if (decoded == null) return null;
-        final oriented = img.bakeOrientation(decoded);
-        final scale = math.min(inputSize / oriented.width, inputSize / oriented.height);
-        final scaledW = (oriented.width * scale).round();
-        final scaledH = (oriented.height * scale).round();
-        final resized = img.copyResize(oriented, width: scaledW, height: scaledH);
-        return {
-          'w': scaledW,
-          'h': scaledH,
-          'bytes': resized.getBytes(order: img.ChannelOrder.rgb),
-        };
-      });
-
-      if (rgbData == null) return DetectionResult.defaultResult;
-
+    if (!_isInitialized || _workerSendPort == null) {
+      await initialize();
       if (!_isInitialized || _workerSendPort == null) {
-        await initialize();
-        if (!_isInitialized || _workerSendPort == null) {
-          return DetectionResult.defaultResult;
-        }
+        return DetectionResult.defaultResult;
       }
+    }
 
+    try {
       final replyPort = ReceivePort();
       _workerSendPort!.send(
-        _StaticImageRequest(
+        _StaticPathRequest(
           replyPort: replyPort.sendPort,
-          scaledW: rgbData['w'] as int,
-          scaledH: rgbData['h'] as int,
-          rgbBytes: TransferableTypedData.fromList([rgbData['bytes'] as Uint8List]),
+          path: path,
         ),
       );
 
@@ -247,6 +232,8 @@ class PaperCornerDetector {
     final double confidence = (rawRes['confidence'] as num?)?.toDouble() ?? 0.0;
     final double areaRatio = (rawRes['areaRatio'] as num?)?.toDouble() ?? 0.0;
     final Map<String, dynamic>? metrics = rawRes['metrics'] as Map<String, dynamic>?;
+    final int? origW = rawRes['origW'] as int?;
+    final int? origH = rawRes['origH'] as int?;
 
     if (!isValid) {
       if (!isStatic) {
@@ -258,6 +245,8 @@ class PaperCornerDetector {
         isValid: false,
         areaRatio: areaRatio,
         metrics: metrics,
+        imageWidth: origW,
+        imageHeight: origH,
       );
     }
 
@@ -269,24 +258,26 @@ class PaperCornerDetector {
       CornerPoint(rawList[6], rawList[7]),
     ];
 
-    // Track consecutive stable frames for auto-capture readiness
-    if (_stabilizedCorners == null || _stabilizedCorners!.length != 4) {
-      _stabilizedCorners = strictCorners;
-      _consecutiveStableFrames = 1;
-    } else {
-      double maxShift = 0.0;
-      for (int i = 0; i < 4; i++) {
-        final dx = strictCorners[i].x - _stabilizedCorners![i].x;
-        final dy = strictCorners[i].y - _stabilizedCorners![i].y;
-        final shift = math.sqrt(dx * dx + dy * dy);
-        if (shift > maxShift) maxShift = shift;
-      }
-      if (maxShift < 0.04) {
-        _consecutiveStableFrames++;
-      } else {
+    if (!isStatic) {
+      // Track consecutive stable frames for auto-capture readiness
+      if (_stabilizedCorners == null || _stabilizedCorners!.length != 4) {
+        _stabilizedCorners = strictCorners;
         _consecutiveStableFrames = 1;
+      } else {
+        double maxShift = 0.0;
+        for (int i = 0; i < 4; i++) {
+          final dx = strictCorners[i].x - _stabilizedCorners![i].x;
+          final dy = strictCorners[i].y - _stabilizedCorners![i].y;
+          final shift = math.sqrt(dx * dx + dy * dy);
+          if (shift > maxShift) maxShift = shift;
+        }
+        if (maxShift < 0.04) {
+          _consecutiveStableFrames++;
+        } else {
+          _consecutiveStableFrames = 1;
+        }
+        _stabilizedCorners = strictCorners;
       }
-      _stabilizedCorners = strictCorners;
     }
 
     // Return the EXACT raw model prediction coordinates (untouched by smoothing)
@@ -296,6 +287,8 @@ class PaperCornerDetector {
       isValid: true,
       areaRatio: areaRatio,
       metrics: metrics,
+      imageWidth: origW,
+      imageHeight: origH,
     );
   }
 
@@ -397,6 +390,16 @@ class _StaticImageRequest {
   });
 }
 
+class _StaticPathRequest {
+  final SendPort replyPort;
+  final String path;
+
+  const _StaticPathRequest({
+    required this.replyPort,
+    required this.path,
+  });
+}
+
 class _CandidateDocument {
   final int anchor;
   final double score;
@@ -434,6 +437,9 @@ void _workerMain(_WorkerInitConfig config) {
       message.replyPort.send(res);
     } else if (message is _StaticImageRequest) {
       final res = engine.processStaticImage(message);
+      message.replyPort.send(res);
+    } else if (message is _StaticPathRequest) {
+      final res = engine.processStaticPath(message.path);
       message.replyPort.send(res);
     }
   });
@@ -715,6 +721,76 @@ class _IsolateTFLiteEngine {
 
       return _decodeOutput(padX, padY, scaledW, scaledH);
     } catch (e) {
+      return {'isValid': false, 'confidence': 0.0, 'areaRatio': 0.0};
+    }
+  }
+
+  Map<String, dynamic> processStaticPath(String path) {
+    try {
+      final file = File(path);
+      if (!file.existsSync()) {
+        return {'isValid': false, 'confidence': 0.0, 'areaRatio': 0.0};
+      }
+      final bytes = file.readAsBytesSync();
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) {
+        return {'isValid': false, 'confidence': 0.0, 'areaRatio': 0.0};
+      }
+      final oriented = img.bakeOrientation(decoded);
+      final origW = oriented.width;
+      final origH = oriented.height;
+      if (origW <= 0 || origH <= 0) {
+        return {'isValid': false, 'confidence': 0.0, 'areaRatio': 0.0};
+      }
+
+      final scale = math.min(inputSize / origW, inputSize / origH);
+      final scaledW = (origW * scale).round();
+      final scaledH = (origH * scale).round();
+      final padX = (inputSize - scaledW) ~/ 2;
+      final padY = (inputSize - scaledH) ~/ 2;
+
+      final resized = img.copyResize(oriented, width: scaledW, height: scaledH);
+
+      _inputBuffer.fillRange(0, _inputBuffer.length, 114.0 / 255.0);
+      final planeSize = inputSize * inputSize;
+
+      for (int sy = 0; sy < scaledH; sy++) {
+        final targetYOffset = (padY + sy) * inputSize;
+        for (int sx = 0; sx < scaledW; sx++) {
+          final pixel = resized.getPixel(sx, sy);
+          final r = _lutNorm255[pixel.r.toInt().clamp(0, 255)];
+          final g = _lutNorm255[pixel.g.toInt().clamp(0, 255)];
+          final b = _lutNorm255[pixel.b.toInt().clamp(0, 255)];
+
+          if (_isInputNHWC) {
+            final idx = (targetYOffset + padX + sx) * 3;
+            _inputBuffer[idx] = r;
+            _inputBuffer[idx + 1] = g;
+            _inputBuffer[idx + 2] = b;
+          } else {
+            final pixelIdx = targetYOffset + padX + sx;
+            _inputBuffer[pixelIdx] = r;
+            _inputBuffer[planeSize + pixelIdx] = g;
+            _inputBuffer[2 * planeSize + pixelIdx] = b;
+          }
+        }
+      }
+
+      if (_interpreter != null) {
+        _interpreter!.getInputTensor(0).setTo(_inputBuffer.buffer);
+        _interpreter!.invoke();
+        _interpreter!.getOutputTensor(_predOutIndex).copyTo(_outputPredsFlat.buffer);
+        _interpreter!.getOutputTensor(_protoOutIndex).copyTo(_outputProtosFlat.buffer);
+
+        final decodedRes = _decodeOutput(padX, padY, scaledW, scaledH);
+        decodedRes['origW'] = origW;
+        decodedRes['origH'] = origH;
+        return decodedRes;
+      } else {
+        return {'isValid': false, 'confidence': 0.0, 'areaRatio': 0.0, 'origW': origW, 'origH': origH};
+      }
+    } catch (e) {
+      debugPrint('[DocuRay] Worker processStaticPath error: $e');
       return {'isValid': false, 'confidence': 0.0, 'areaRatio': 0.0};
     }
   }

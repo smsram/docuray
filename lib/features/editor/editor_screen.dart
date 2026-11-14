@@ -8,7 +8,6 @@ import '../../core/providers/editor_provider.dart';
 import '../../core/providers/documents_provider.dart';
 import '../../core/providers/scanner_provider.dart';
 import '../../core/providers/settings_provider.dart';
-import '../../core/services/jpeg_metadata.dart';
 import '../../core/services/pdf_generator_service.dart';
 import '../../core/routing/app_router.dart';
 import '../../core/widgets/document_thumbnail.dart';
@@ -29,9 +28,6 @@ class _EditorScreenState extends State<EditorScreen> {
   double _brightness = 0.0;
   double _contrast = 0.0;
   double _sharpness = 0.0;
-  double _sourceAspectRatio = 3.0 / 4.0;
-  ImageStream? _imageStream;
-  ImageStreamListener? _imageStreamListener;
 
   /// Sync slider values from the current page's stored adjustments.
   void _syncSlidersFromPage(EditorProvider editor) {
@@ -42,39 +38,7 @@ class _EditorScreenState extends State<EditorScreen> {
         _contrast = page.contrast;
         _sharpness = page.sharpness;
       });
-      _resolveSourceImageAspectRatio(page.originalImagePath);
     }
-  }
-
-  String? _lastResolvedPath;
-
-  void _resolveSourceImageAspectRatio(String? path) {
-    if (path == null || path == _lastResolvedPath) return;
-    _lastResolvedPath = path;
-    final file = File(path);
-    if (!file.existsSync()) return;
-
-    // Fast header inspection for instantaneous aspect ratio
-    JpegMetadata.fromFile(file).then((meta) {
-      if (meta != null && meta.uprightWidth > 0 && meta.uprightHeight > 0 && mounted) {
-        setState(() {
-          _sourceAspectRatio = meta.uprightAspectRatio;
-        });
-      }
-    });
-
-    _imageStreamListener?.let((l) => _imageStream?.removeListener(l));
-    final stream = FileImage(file).resolve(const ImageConfiguration());
-    final listener = ImageStreamListener((info, _) {
-      if (mounted) {
-        setState(() {
-          _sourceAspectRatio = info.image.width / info.image.height;
-        });
-      }
-    });
-    _imageStream = stream;
-    _imageStreamListener = listener;
-    stream.addListener(listener);
   }
 
   @override
@@ -91,12 +55,22 @@ class _EditorScreenState extends State<EditorScreen> {
         }
       }
       _syncSlidersFromPage(editor);
+
+      final page = editor.currentPage;
+      if (page != null && page.autoDetectedCorners == null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No document detected. You can adjust crop corners manually.'),
+            duration: Duration(seconds: 3),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
     });
   }
 
   @override
   void dispose() {
-    _imageStreamListener?.let((l) => _imageStream?.removeListener(l));
     super.dispose();
   }
 
@@ -501,18 +475,18 @@ class _EditorScreenState extends State<EditorScreen> {
     // overlaying the exact 4 draggable corner and edge handles.
     if (editor.activeTool == EditorActiveTool.crop) {
       if (page?.originalImagePath != null && File(page!.originalImagePath!).existsSync()) {
-        _resolveSourceImageAspectRatio(page.originalImagePath);
+        final pageAspect = page.aspectRatio;
         final maxW = constraints.maxWidth * 0.95;
         final maxH = constraints.maxHeight * 0.95;
         final boxAspect = maxW / maxH;
 
         double renderW, renderH;
-        if (_sourceAspectRatio > boxAspect) {
+        if (pageAspect > boxAspect) {
           renderW = maxW;
-          renderH = maxW / _sourceAspectRatio;
+          renderH = maxW / pageAspect;
         } else {
           renderH = maxH;
-          renderW = maxH * _sourceAspectRatio;
+          renderW = maxH * pageAspect;
         }
 
         return SizedBox(
@@ -1316,8 +1290,4 @@ class _EditorOutlinePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _EditorOutlinePainter oldDelegate) => true;
-}
-
-extension _ScopeExtension<T> on T {
-  R let<R>(R Function(T it) block) => block(this);
 }

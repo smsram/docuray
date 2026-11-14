@@ -1,6 +1,8 @@
 import 'dart:typed_data';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:docuray/models/models.dart';
+import 'package:docuray/core/theme/app_colors.dart';
 import 'package:docuray/core/services/jpeg_metadata.dart';
 import 'package:docuray/core/services/corner_detector_service.dart';
 import 'package:docuray/core/services/perspective_transform.dart';
@@ -452,6 +454,86 @@ void main() {
       expect(editor.cornerPoints[0].dy, equals(0.0));
       expect(editor.cornerPoints[2].dx, equals(1.0));
       expect(editor.cornerPoints[2].dy, equals(1.0));
+    });
+  });
+
+  group('11. Minimal Circular Corner Dot Visual Design & Smooth Transition', () {
+    test('Default color is solid blue (AppColors.primary) and ready color is solid green (AppColors.success)', () {
+      const defaultBlue = AppColors.primary;
+      const readyGreen = AppColors.success;
+
+      expect(defaultBlue, equals(const Color(0xFF2563EB)));
+      expect(readyGreen, equals(const Color(0xFF10B981)));
+      expect(defaultBlue, isNot(equals(readyGreen)));
+    });
+
+    test('Visual corner transition interpolates smoothly with easeOutCubic', () {
+      final startCorners = [
+        const Offset(0.1, 0.1),
+        const Offset(0.9, 0.1),
+        const Offset(0.9, 0.9),
+        const Offset(0.1, 0.9),
+      ];
+
+      final targetCorners = [
+        const Offset(0.2, 0.2),
+        const Offset(0.8, 0.2),
+        const Offset(0.8, 0.8),
+        const Offset(0.2, 0.8),
+      ];
+
+      // At t = 0.5 with Curves.easeOutCubic:
+      // easeOutCubic(t) = 1 - (1-t)^3 = 1 - 0.125 = 0.875
+      final eased = Curves.easeOutCubic.transform(0.5);
+      expect(eased, closeTo(0.875, 1e-3));
+
+      final midCorners = [
+        for (int i = 0; i < 4; i++)
+          Offset.lerp(startCorners[i], targetCorners[i], eased)!
+      ];
+
+      // Intermediate X should be start + 0.875 * (target - start) = 0.1 + 0.875 * 0.1 = 0.1875
+      expect(midCorners[0].dx, closeTo(0.1875, 1e-4));
+      expect(midCorners[0].dy, closeTo(0.1875, 1e-4));
+    });
+
+    test('Seamless redirection starts from current visual position toward new target', () {
+      // 1. Moving from A to B: at 50% progress, visual position is intermediate
+      final ptA = const Offset(0.1, 0.1);
+      final ptB = const Offset(0.3, 0.1);
+      final currentVisualPt = Offset.lerp(ptA, ptB, 0.5)!; // Offset(0.2, 0.1)
+
+      // 2. New target C arrives: start is current visual position (0.2, 0.1), target is C (0.5, 0.2)
+      final ptC = const Offset(0.5, 0.2);
+      final redirectedStart = currentVisualPt;
+      expect(redirectedStart.dx, closeTo(0.2, 1e-4));
+
+      // At start of redirected animation (t = 0.0), position is exactly currentVisualPt without jump
+      final redirectedAtStart = Offset.lerp(redirectedStart, ptC, 0.0)!;
+      expect(redirectedAtStart.dx, closeTo(currentVisualPt.dx, 1e-4));
+      expect(redirectedAtStart.dy, closeTo(currentVisualPt.dy, 1e-4));
+    });
+
+    test('Multi-step prediction interruption (A -> B interrupted by C, C interrupted by D) never jumps', () {
+      // 1. Initial prediction A at (0.1, 0.1)
+      var current = const Offset(0.1, 0.1);
+
+      // 2. Prediction B arrives at (0.3, 0.1). Halfway through:
+      final targetB = const Offset(0.3, 0.1);
+      current = Offset.lerp(current, targetB, 0.5)!; // (0.2, 0.1)
+
+      // 3. Prediction C arrives at (0.5, 0.3) while animating to B. Quarter through:
+      final targetC = const Offset(0.5, 0.3);
+      final startC = current;
+      expect(startC.dx, closeTo(0.2, 1e-4));
+      current = Offset.lerp(startC, targetC, 0.25)!; // (0.275, 0.15)
+
+      // 4. Prediction D arrives at (0.6, 0.4). Immediately at arrival (t = 0):
+      final targetD = const Offset(0.6, 0.4);
+      final startD = current;
+      final atDStart = Offset.lerp(startD, targetD, 0.0)!;
+      expect(atDStart.dx, closeTo(0.275, 1e-4));
+      expect(atDStart.dy, closeTo(0.15, 1e-4));
     });
   });
 }

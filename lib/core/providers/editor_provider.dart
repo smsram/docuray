@@ -100,7 +100,11 @@ class EditorProvider extends ChangeNotifier {
       ];
     }
     _currentPageIndex = 0;
-    _activeTool = EditorActiveTool.none;
+    if (initialPages.isNotEmpty && initialPages.first.autoDetectedCorners == null) {
+      _activeTool = EditorActiveTool.crop;
+    } else {
+      _activeTool = EditorActiveTool.none;
+    }
     if (title != null && title.isNotEmpty) {
       _documentTitle = title;
     } else if (_documentTitle.isEmpty) {
@@ -361,6 +365,9 @@ class EditorProvider extends ChangeNotifier {
     final newPageNumber = _pages.length + 1;
     _pages.add(page.copyWith(pageNumber: newPageNumber));
     _currentPageIndex = _pages.length - 1;
+    if (_pages.length == 1 && page.autoDetectedCorners == null) {
+      _activeTool = EditorActiveTool.crop;
+    }
     _syncCornerPoints();
     _triggerPreviewUpdate();
     notifyListeners();

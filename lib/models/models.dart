@@ -37,6 +37,8 @@ class DocumentPage {
   final double sharpness;  // 0.0 to 1.0
   final List<CornerPoint> corners;
   final List<CornerPoint>? autoDetectedCorners;
+  final int? imageWidth;
+  final int? imageHeight;
 
   const DocumentPage({
     required this.id,
@@ -56,7 +58,15 @@ class DocumentPage {
       CornerPoint(0.05, 0.95),
     ],
     this.autoDetectedCorners,
+    this.imageWidth,
+    this.imageHeight,
   });
+
+  /// Upright aspect ratio (width / height) based on actual oriented image dimensions
+  double get aspectRatio =>
+      (imageWidth != null && imageHeight != null && imageHeight! > 0)
+          ? (imageWidth! / imageHeight!)
+          : (3.0 / 4.0);
 
   /// Convenient backward-compatible getter for displaying the current page image
   String? get imagePath => processedImagePath ?? originalImagePath;
@@ -74,6 +84,8 @@ class DocumentPage {
     double? sharpness,
     List<CornerPoint>? corners,
     List<CornerPoint>? autoDetectedCorners,
+    int? imageWidth,
+    int? imageHeight,
   }) {
     return DocumentPage(
       id: id ?? this.id,
@@ -88,6 +100,8 @@ class DocumentPage {
       sharpness: sharpness ?? this.sharpness,
       corners: corners ?? this.corners,
       autoDetectedCorners: autoDetectedCorners ?? this.autoDetectedCorners,
+      imageWidth: imageWidth ?? this.imageWidth,
+      imageHeight: imageHeight ?? this.imageHeight,
     );
   }
 
@@ -105,6 +119,8 @@ class DocumentPage {
     'corners': corners.map((c) => c.toJson()).toList(),
     if (autoDetectedCorners != null)
       'autoDetectedCorners': autoDetectedCorners!.map((c) => c.toJson()).toList(),
+    if (imageWidth != null) 'imageWidth': imageWidth,
+    if (imageHeight != null) 'imageHeight': imageHeight,
   };
 
   factory DocumentPage.fromJson(Map<String, dynamic> json) {
@@ -131,6 +147,8 @@ class DocumentPage {
       autoDetectedCorners: (json['autoDetectedCorners'] as List<dynamic>?)
           ?.map((c) => CornerPoint.fromJson(c as Map<String, dynamic>))
           .toList(),
+      imageWidth: json['imageWidth'] as int?,
+      imageHeight: json['imageHeight'] as int?,
     );
   }
 }

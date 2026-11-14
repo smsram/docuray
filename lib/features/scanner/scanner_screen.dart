@@ -1,4 +1,4 @@
-import 'dart:math' as math;
+import 'dart:async';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
@@ -22,19 +22,13 @@ class ScannerScreen extends StatefulWidget {
 }
 
 class _ScannerScreenState extends State<ScannerScreen>
-    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
-  late AnimationController _pulseController;
+    with WidgetsBindingObserver {
   bool _isNavigating = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1400),
-    )..repeat(reverse: true);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final scanner = context.read<ScannerProvider>();
@@ -65,7 +59,7 @@ class _ScannerScreenState extends State<ScannerScreen>
     final scanner = context.read<ScannerProvider>();
     if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
       scanner.pauseCamera();
-    } else if (state == AppLifecycleState.resumed && !_isNavigating) {
+    } else if (state == AppLifecycleState.resumed && !_isNavigating && !_isImportingGallery) {
       scanner.resumeCamera();
     }
   }
@@ -73,7 +67,6 @@ class _ScannerScreenState extends State<ScannerScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _pulseController.dispose();
     try {
       context.read<ScannerProvider>().pauseCamera();
     } catch (_) {}
@@ -622,6 +615,22 @@ class _ScannerScreenState extends State<ScannerScreen>
       );
     }
 
+    if (_isImportingGallery || scanner.state == ScannerState.processing) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(color: AppColors.primary),
+            const SizedBox(height: 16),
+            Text(
+              'Analyzing document...',
+              style: AppTypography.secondary.copyWith(color: Colors.white70),
+            ),
+          ],
+        ),
+      );
+    }
+
     if (scanner.isCameraReady) {
       if (NativeScannerService.isNativeSupported && ScannerProvider.useNativePlatformView) {
         return AndroidView(
@@ -666,7 +675,6 @@ class _ScannerScreenState extends State<ScannerScreen>
                             targetCorners: corners ?? const [],
                             isTracking: isTracking,
                             isReady: scanner.state == ScannerState.ready,
-                            pulseValue: _pulseController.value,
                             captureType: scanner.captureType,
                           );
                         },
@@ -740,14 +748,12 @@ class _SmoothCornerOverlay extends StatefulWidget {
   final List<Offset> targetCorners;
   final bool isTracking;
   final bool isReady;
-  final double pulseValue;
   final String captureType;
 
   const _SmoothCornerOverlay({
     required this.targetCorners,
     required this.isTracking,
     required this.isReady,
-    required this.pulseValue,
     required this.captureType,
   });
 
@@ -756,165 +762,201 @@ class _SmoothCornerOverlay extends StatefulWidget {
 }
 
 class _SmoothCornerOverlayState extends State<_SmoothCornerOverlay>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _tickerController;
+    with TickerProviderStateMixin {
+  late final AnimationController _moveController;
+  late final CurvedAnimation _moveCurved;
+
+  late final AnimationController _colorController;
+  late final Animation<Color?> _colorAnimation;
+
+  late final AnimationController _fadeController;
+  late final Animation<double> _fadeAnimation;
+
+  Timer? _graceTimer;
+  DateTime? _lastPredictionTime;
+  bool _hasFirstPrediction = false;
 
   // Visual display coordinates (used exclusively for rendering the 4 visual corner dots)
-  List<Offset> _currentCorners = [];
-
-  // Timestamp-based interpolation state: start -> target with dynamic interval adaptation
-  List<Offset> _animStartCorners = [];
+  List<Offset> _displayedCorners = [];
+  List<Offset> _startCorners = [];
   List<Offset> _targetCorners = [];
-  DateTime _animStartTime = DateTime.now();
-  int _animDurationMs = 110;
-  DateTime _lastPredictionTime = DateTime.fromMillisecondsSinceEpoch(0);
-  DateTime _lastValidDetectionTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
     super.initState();
-    _initCorners(widget.targetCorners);
 
-    // Continuous vsync ticker for fluid independent corner movement
-    _tickerController = AnimationController(
+    _moveController = AnimationController(
       vsync: this,
-      duration: const Duration(seconds: 1),
-    )..addListener(_onTick);
-    _tickerController.repeat();
+      duration: const Duration(milliseconds: 120),
+    );
+    _moveCurved = CurvedAnimation(
+      parent: _moveController,
+      curve: Curves.easeOutCubic,
+    );
+    _moveController.addListener(_onMoveTick);
+
+    _colorController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 200),
+    );
+    _colorAnimation = ColorTween(
+      begin: AppColors.primary,
+      end: AppColors.success,
+    ).animate(CurvedAnimation(
+      parent: _colorController,
+      curve: Curves.easeInOut,
+    ));
+    if (widget.isReady) {
+      _colorController.value = 1.0;
+    }
+
+    _fadeController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 180),
+    );
+    _fadeAnimation = CurvedAnimation(
+      parent: _fadeController,
+      curve: Curves.easeOut,
+    );
+    _fadeController.addStatusListener((status) {
+      if (status == AnimationStatus.dismissed) {
+        _hasFirstPrediction = false;
+        _displayedCorners.clear();
+        _startCorners.clear();
+        _targetCorners.clear();
+        _moveController.stop();
+      }
+    });
+
+    if (widget.isTracking && widget.targetCorners.length == 4) {
+      _initFirstPrediction(widget.targetCorners);
+    }
   }
 
-  void _initCorners(List<Offset> corners) {
-    if (corners.length >= 4 && widget.isTracking) {
-      _currentCorners = List.from(corners);
-      _animStartCorners = List.from(corners);
-      _targetCorners = List.from(corners);
-      _lastValidDetectionTime = DateTime.now();
-      _lastPredictionTime = DateTime.now();
-    } else {
-      // Do NOT initialize with placeholder coordinates
-      _currentCorners = [];
-      _animStartCorners = [];
-      _targetCorners = [];
-      _lastValidDetectionTime = DateTime.fromMillisecondsSinceEpoch(0);
+  void _initFirstPrediction(List<Offset> corners) {
+    _hasFirstPrediction = true;
+    _displayedCorners = List.from(corners);
+    _startCorners = List.from(corners);
+    _targetCorners = List.from(corners);
+    _lastPredictionTime = DateTime.now();
+    _fadeController.value = 1.0;
+  }
+
+  void _onMoveTick() {
+    if (_startCorners.length == 4 && _targetCorners.length == 4) {
+      final t = _moveCurved.value;
+      _displayedCorners = [
+        for (int i = 0; i < 4; i++)
+          Offset.lerp(_startCorners[i], _targetCorners[i], t)!,
+      ];
     }
   }
 
   @override
   void didUpdateWidget(covariant _SmoothCornerOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
-    final now = DateTime.now();
 
-    if (widget.targetCorners.length >= 4 && widget.isTracking) {
-      final bool wasNotTracking = !oldWidget.isTracking || _currentCorners.length < 4;
-      final bool longTimeNoDetection = now.difference(_lastValidDetectionTime).inMilliseconds > 250;
-
-      if (wasNotTracking || longTimeNoDetection) {
-        // Immediate visual lock-on: first valid prediction sets exact positions with zero delay
-        _currentCorners = List.from(widget.targetCorners);
-        _animStartCorners = List.from(widget.targetCorners);
-        _targetCorners = List.from(widget.targetCorners);
-        _animStartTime = now;
-        _animDurationMs = 100;
+    // 1. Color transition between blue and green
+    if (widget.isReady != oldWidget.isReady) {
+      if (widget.isReady) {
+        _colorController.forward();
       } else {
-        // Smooth redirection: seamlessly start from current displayed position toward newest target
-        _animStartCorners = List.from(_currentCorners);
-        // Preserve exact [TL, TR, BR, BL] corner order without permutations
-        _targetCorners = List.from(widget.targetCorners);
+        _colorController.reverse();
+      }
+    }
 
-        // Adapt animation duration to actual prediction interval (typically 80-130ms at 8-12 FPS)
-        if (_lastPredictionTime.millisecondsSinceEpoch > 0) {
-          final interval = now.difference(_lastPredictionTime).inMilliseconds;
-          _animDurationMs = interval.clamp(70, 160);
-        }
-        _animStartTime = now;
+    // 2. Tracking and position update
+    final bool hasValidTarget = widget.isTracking && widget.targetCorners.length == 4;
+
+    if (hasValidTarget) {
+      _graceTimer?.cancel();
+      _graceTimer = null;
+
+      if (_fadeController.status != AnimationStatus.forward &&
+          _fadeController.status != AnimationStatus.completed) {
+        _fadeController.forward();
       }
 
-      _lastPredictionTime = now;
-      _lastValidDetectionTime = now;
+      final now = DateTime.now();
+
+      if (!_hasFirstPrediction || _displayedCorners.length < 4) {
+        // Immediate visual appearance for first valid prediction
+        _initFirstPrediction(widget.targetCorners);
+      } else {
+        // Subsequent predictions: dynamically adapt duration and smoothly redirect
+        if (_lastPredictionTime != null) {
+          final intervalMs = now.difference(_lastPredictionTime!).inMilliseconds;
+          _moveController.duration = Duration(milliseconds: intervalMs.clamp(80, 180));
+        } else {
+          _moveController.duration = const Duration(milliseconds: 120);
+        }
+        _lastPredictionTime = now;
+
+        // Start from current displayed position
+        _startCorners = List.from(_displayedCorners);
+        _targetCorners = List.from(widget.targetCorners);
+
+        _moveController.stop();
+        _moveController.forward(from: 0.0);
+      }
+    } else {
+      // Detection lost: start brief grace window before fading out
+      if (_graceTimer == null && _fadeController.value > 0.0) {
+        _graceTimer = Timer(const Duration(milliseconds: 180), () {
+          if (mounted && (!widget.isTracking || widget.targetCorners.length < 4)) {
+            _fadeController.reverse();
+          }
+        });
+      }
     }
   }
 
   @override
   void dispose() {
-    _tickerController.dispose();
+    _graceTimer?.cancel();
+    _moveController.dispose();
+    _colorController.dispose();
+    _fadeController.dispose();
     super.dispose();
-  }
-
-  void _onTick() {
-    if (_currentCorners.length < 4 || _targetCorners.length < 4 || _animStartCorners.length < 4) {
-      return;
-    }
-
-    final now = DateTime.now();
-    final elapsedMs = now.difference(_animStartTime).inMilliseconds;
-    final progress = (elapsedMs / _animDurationMs).clamp(0.0, 1.0);
-    final eased = Curves.easeOutCubic.transform(progress);
-
-    bool moved = false;
-    for (int i = 0; i < 4; i++) {
-      final start = _animStartCorners[i];
-      final target = _targetCorners[i];
-      final newX = start.dx + (target.dx - start.dx) * eased;
-      final newY = start.dy + (target.dy - start.dy) * eased;
-
-      if ((newX - _currentCorners[i].dx).abs() > 0.0001 ||
-          (newY - _currentCorners[i].dy).abs() > 0.0001) {
-        _currentCorners[i] = Offset(newX, newY);
-        moved = true;
-      }
-    }
-
-    final bool hasCorners = _currentCorners.length == 4;
-    final bool shouldShow = hasCorners &&
-        (widget.isTracking || now.difference(_lastValidDetectionTime).inMilliseconds < 250);
-
-    if (mounted && (moved || shouldShow)) {
-      setState(() {});
-    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final now = DateTime.now();
-    final timeSinceDetection = now.difference(_lastValidDetectionTime).inMilliseconds;
-    final bool hasCorners = _currentCorners.length == 4;
-    // Show ONLY when actual valid corners exist and either actively tracking or within brief 250ms grace window
-    final bool shouldShow = hasCorners && (widget.isTracking || timeSinceDetection < 250);
+    return AnimatedBuilder(
+      animation: Listenable.merge([_moveController, _colorController, _fadeController]),
+      builder: (context, _) {
+        final opacity = _fadeAnimation.value;
+        if (opacity <= 0.0 || _displayedCorners.length < 4) {
+          return const SizedBox.shrink();
+        }
 
-    // Continuous 60/120fps independent smooth sinusoidal pulse
-    final pulseValue = 0.5 + 0.5 * math.sin((now.millisecondsSinceEpoch % 1400) / 1400.0 * 2.0 * math.pi);
+        final currentColor = _colorAnimation.value ?? AppColors.primary;
 
-    return AnimatedOpacity(
-      opacity: shouldShow ? 1.0 : 0.0,
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOut,
-      child: CustomPaint(
-        painter: _CornerDetectionPainter(
-          corners: _currentCorners,
-          isReady: widget.isReady,
-          pulseValue: pulseValue,
-          captureType: widget.captureType,
-          isTracking: shouldShow,
-        ),
-      ),
+        return CustomPaint(
+          painter: _CornerDotPainter(
+            corners: _displayedCorners,
+            color: currentColor,
+            opacity: opacity,
+            captureType: widget.captureType,
+          ),
+        );
+      },
     );
   }
 }
 
-/// Draws ONLY FOUR SMOOTH CIRCULAR CORNER INDICATORS (NO polygon or frame lines) + ID Card Guide
-class _CornerDetectionPainter extends CustomPainter {
+/// Draws ONLY FOUR MINIMAL CIRCULAR CORNER DOTS (NO polygon or frame lines) + optional ID Card Guide
+class _CornerDotPainter extends CustomPainter {
   final List<Offset> corners;
-  final bool isReady;
-  final double pulseValue;
+  final Color color;
+  final double opacity;
   final String captureType;
-  final bool isTracking;
 
-  _CornerDetectionPainter({
+  const _CornerDotPainter({
     required this.corners,
-    required this.isReady,
-    required this.pulseValue,
+    required this.color,
+    required this.opacity,
     required this.captureType,
-    required this.isTracking,
   });
 
   @override
@@ -954,77 +996,41 @@ class _CornerDetectionPainter extends CustomPainter {
       canvas.drawLine(Offset(left + 16, top + cardH), Offset(left + bracketLen, top + cardH), bracketPaint);
     }
 
-    if (!isTracking || corners.length < 4) return;
+    if (opacity <= 0.0 || corners.length < 4) return;
 
-    final actualPoints = corners.map((c) => Offset(c.dx * size.width, c.dy * size.height)).toList();
-    final activeColor = isReady ? AppColors.success : AppColors.primary;
+    final dotAlpha = (opacity * 255).round().clamp(0, 255);
 
-    // 2. Render ONLY the FOUR SMOOTH CIRCULAR CORNER INDICATORS
-    // No polygon lines, no frame outlines, no bounding boxes
-    for (final pt in actualPoints) {
-      // (a) Deep contrast shadow backing so the dot is legible on pure white paper or any background
-      canvas.drawCircle(
-        pt,
-        11.0,
-        Paint()
-          ..color = Colors.black.withAlpha(140)
-          ..style = PaintingStyle.fill,
-      );
+    // Subtle contrast shadow backing so the white border remains crisp against white paper
+    final shadowPaint = Paint()
+      ..color = Colors.black.withAlpha((dotAlpha * 0.35).round())
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true;
 
-      // (b) Outer animated pulsing reticle / halo ring
-      final haloRadius = isReady ? (16.0 + pulseValue * 6.0) : (13.5 + pulseValue * 4.0);
-      final haloAlpha = isReady ? (120 + (pulseValue * 70).toInt()) : (70 + (pulseValue * 40).toInt());
-      canvas.drawCircle(
-        pt,
-        haloRadius,
-        Paint()
-          ..color = activeColor.withAlpha(haloAlpha.clamp(0, 255))
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = isReady ? 2.5 : 2.0,
-      );
+    // Clean white border around each dot
+    final borderPaint = Paint()
+      ..color = Colors.white.withAlpha(dotAlpha)
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true;
 
-      // (c) When ready: an additional vibrant outer aura ring for unmistakable capture confirmation
-      if (isReady) {
-        canvas.drawCircle(
-          pt,
-          23.0 + (pulseValue * 4.0),
-          Paint()
-            ..color = AppColors.success.withAlpha((40 + (pulseValue * 30).toInt()).clamp(0, 255))
-            ..style = PaintingStyle.stroke
-            ..strokeWidth = 1.5,
-        );
-      }
+    // Inner solid circular dot (solid blue or solid green)
+    final fillPaint = Paint()
+      ..color = color.withAlpha(dotAlpha)
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true;
 
-      // (d) Main solid circular indicator disc
-      canvas.drawCircle(
-        pt,
-        8.5,
-        Paint()
-          ..color = activeColor
-          ..style = PaintingStyle.fill,
-      );
-
-      // (e) Subtle dark ring separating the disc and the center reticle core
-      canvas.drawCircle(
-        pt,
-        4.5,
-        Paint()
-          ..color = Colors.black.withAlpha(70)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 1.0,
-      );
-
-      // (f) Center white precision reticle dot
-      canvas.drawCircle(
-        pt,
-        3.5,
-        Paint()
-          ..color = Colors.white
-          ..style = PaintingStyle.fill,
-      );
+    // 2. Render ONLY the FOUR MINIMAL SOLID CIRCULAR CORNER DOTS WITH WHITE BORDER
+    // No connected lines, document outline, frames, labels, gradients, or multicolored effects
+    for (final c in corners) {
+      final pt = Offset(c.dx * size.width, c.dy * size.height);
+      // (a) Contrast shadow backing for visibility against white paper
+      canvas.drawCircle(pt, 10.0, shadowPaint);
+      // (b) Clean solid white outer border ring (radius 9.0)
+      canvas.drawCircle(pt, 9.0, borderPaint);
+      // (c) Inner solid colored dot (radius 6.8, gives a clean 2.2px white border)
+      canvas.drawCircle(pt, 6.8, fillPaint);
     }
   }
 
   @override
-  bool shouldRepaint(covariant _CornerDetectionPainter oldDelegate) => true;
+  bool shouldRepaint(covariant _CornerDotPainter oldDelegate) => true;
 }
