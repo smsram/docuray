@@ -54,6 +54,7 @@ class PaperCornerDetector {
   SendPort? _workerSendPort;
   bool _isInitialized = false;
   bool _isInitializing = false;
+  DateTime? _lastInitAttempt;
 
   // Temporal stabilization on main isolate
   List<CornerPoint>? _stabilizedCorners;
@@ -64,6 +65,12 @@ class PaperCornerDetector {
 
   Future<void> initialize() async {
     if (_isInitialized || _isInitializing) return;
+
+    // Throttle failed initialization attempts to avoid blocking main thread with asset loads
+    if (_lastInitAttempt != null && DateTime.now().difference(_lastInitAttempt!).inSeconds < 2) {
+      return;
+    }
+    _lastInitAttempt = DateTime.now();
     _isInitializing = true;
 
     try {
@@ -123,6 +130,7 @@ class PaperCornerDetector {
         if (hasYuv) vBytes,
       ];
 
+      final submitTimeMs = DateTime.now().millisecondsSinceEpoch;
       final replyPort = ReceivePort();
       _workerSendPort!.send(
         _CameraFrameRequest(
@@ -140,11 +148,12 @@ class PaperCornerDetector {
           uPlaneLen: uBytes.length,
           vPlaneLen: vBytes.length,
           planes: TransferableTypedData.fromList(planesData),
+          submitTimeMs: submitTimeMs,
         ),
       );
 
       final rawRes = await replyPort.first as Map<String, dynamic>;
-      return _processWorkerResponse(rawRes);
+      return _processWorkerResponse(rawRes, isStatic: false);
     } catch (e) {
       debugPrint('[DocuRay] Live camera isolate error: $e');
       return DetectionResult.defaultResult;
@@ -190,7 +199,7 @@ class PaperCornerDetector {
       );
 
       final rawRes = await replyPort.first as Map<String, dynamic>;
-      return _processWorkerResponse(rawRes);
+      return _processWorkerResponse(rawRes, isStatic: true);
     } catch (e) {
       debugPrint('[DocuRay] detectCornersFromPath error: $e');
       return DetectionResult.defaultResult;
@@ -226,23 +235,25 @@ class PaperCornerDetector {
       );
 
       final rawRes = await replyPort.first as Map<String, dynamic>;
-      return _processWorkerResponse(rawRes);
+      return _processWorkerResponse(rawRes, isStatic: true);
     } catch (e) {
       debugPrint('[DocuRay] Static image isolate error: $e');
       return DetectionResult.defaultResult;
     }
   }
 
-  DetectionResult _processWorkerResponse(Map<String, dynamic> rawRes) {
+  DetectionResult _processWorkerResponse(Map<String, dynamic> rawRes, {bool isStatic = false}) {
     final bool isValid = rawRes['isValid'] as bool? ?? false;
     final double confidence = (rawRes['confidence'] as num?)?.toDouble() ?? 0.0;
     final double areaRatio = (rawRes['areaRatio'] as num?)?.toDouble() ?? 0.0;
     final Map<String, dynamic>? metrics = rawRes['metrics'] as Map<String, dynamic>?;
 
     if (!isValid) {
-      _consecutiveStableFrames = 0;
+      if (!isStatic) {
+        _consecutiveStableFrames = 0;
+      }
       return DetectionResult(
-        corners: _stabilizedCorners ?? DetectionResult.defaultResult.corners,
+        corners: isStatic ? DetectionResult.defaultResult.corners : (_stabilizedCorners ?? DetectionResult.defaultResult.corners),
         confidence: confidence,
         isValid: false,
         areaRatio: areaRatio,
@@ -258,9 +269,29 @@ class PaperCornerDetector {
       CornerPoint(rawList[6], rawList[7]),
     ];
 
-    final smoothed = _applyTemporalStabilization(strictCorners);
+    // Track consecutive stable frames for auto-capture readiness
+    if (_stabilizedCorners == null || _stabilizedCorners!.length != 4) {
+      _stabilizedCorners = strictCorners;
+      _consecutiveStableFrames = 1;
+    } else {
+      double maxShift = 0.0;
+      for (int i = 0; i < 4; i++) {
+        final dx = strictCorners[i].x - _stabilizedCorners![i].x;
+        final dy = strictCorners[i].y - _stabilizedCorners![i].y;
+        final shift = math.sqrt(dx * dx + dy * dy);
+        if (shift > maxShift) maxShift = shift;
+      }
+      if (maxShift < 0.04) {
+        _consecutiveStableFrames++;
+      } else {
+        _consecutiveStableFrames = 1;
+      }
+      _stabilizedCorners = strictCorners;
+    }
+
+    // Return the EXACT raw model prediction coordinates (untouched by smoothing)
     return DetectionResult(
-      corners: smoothed,
+      corners: strictCorners,
       confidence: confidence,
       isValid: true,
       areaRatio: areaRatio,
@@ -268,7 +299,13 @@ class PaperCornerDetector {
     );
   }
 
-  List<CornerPoint> _applyTemporalStabilization(List<CornerPoint> newCorners) {
+  void resetStabilization() {
+    _stabilizedCorners = null;
+    _consecutiveStableFrames = 0;
+  }
+
+  @visibleForTesting
+  List<CornerPoint> applyStabilizationForTesting(List<CornerPoint> newCorners) {
     if (_stabilizedCorners == null || _stabilizedCorners!.length != 4) {
       _stabilizedCorners = newCorners;
       _consecutiveStableFrames = 1;
@@ -289,21 +326,8 @@ class PaperCornerDetector {
       _consecutiveStableFrames = 1;
     }
 
-    const alpha = 0.55;
-    final smoothed = List.generate(4, (i) {
-      return CornerPoint(
-        alpha * newCorners[i].x + (1.0 - alpha) * _stabilizedCorners![i].x,
-        alpha * newCorners[i].y + (1.0 - alpha) * _stabilizedCorners![i].y,
-      );
-    });
-
-    _stabilizedCorners = smoothed;
-    return smoothed;
-  }
-
-  void resetStabilization() {
-    _stabilizedCorners = null;
-    _consecutiveStableFrames = 0;
+    _stabilizedCorners = newCorners;
+    return newCorners;
   }
 }
 
@@ -338,6 +362,7 @@ class _CameraFrameRequest {
   final int uPlaneLen;
   final int vPlaneLen;
   final TransferableTypedData planes;
+  final int submitTimeMs;
 
   const _CameraFrameRequest({
     required this.replyPort,
@@ -354,6 +379,7 @@ class _CameraFrameRequest {
     required this.uPlaneLen,
     required this.vPlaneLen,
     required this.planes,
+    required this.submitTimeMs,
   });
 }
 
@@ -455,17 +481,25 @@ class _IsolateTFLiteEngine {
         _bTableU[i] = (1.772 * uv * 1024).round();
       }
 
-      final options = InterpreterOptions()..threads = 4;
+      bool loaded = false;
       if (isAndroid) {
         try {
-          options.addDelegate(XNNPackDelegate());
-          _activeBackend = 'XNNPACK';
-        } catch (_) {
-          _activeBackend = 'CPU (4T)';
+          final xnnOptions = InterpreterOptions()..threads = 3;
+          xnnOptions.addDelegate(XNNPackDelegate());
+          _interpreter = Interpreter.fromBuffer(modelBytes, options: xnnOptions);
+          _activeBackend = 'XNNPACK (3T)';
+          loaded = true;
+        } catch (e) {
+          debugPrint('[DocuRay] XNNPack delegate init failed, falling back to CPU: $e');
         }
       }
 
-      _interpreter = Interpreter.fromBuffer(modelBytes, options: options);
+      if (!loaded) {
+        final cpuOptions = InterpreterOptions()..threads = 3;
+        _interpreter = Interpreter.fromBuffer(modelBytes, options: cpuOptions);
+        _activeBackend = 'CPU (3T)';
+      }
+
       _interpreter!.allocateTensors();
 
       final inputShape = _interpreter!.getInputTensor(0).shape;
@@ -490,6 +524,7 @@ class _IsolateTFLiteEngine {
 
       // Allocate flat typed buffers once
       _inputBuffer = Float32List(1 * 3 * inputSize * inputSize);
+      _inputBuffer.fillRange(0, _inputBuffer.length, 114.0 / 255.0);
       _outputPredsFlat = Float32List(1 * 37 * numAnchors);
       _outputProtosFlat = Float32List(1 * protoSize * protoSize * numProtos);
       _maskGrid = List.generate(protoSize, (_) => Uint8List(protoSize));
@@ -504,6 +539,7 @@ class _IsolateTFLiteEngine {
 
   Map<String, dynamic> processCameraFrame(_CameraFrameRequest req) {
     final totalSw = Stopwatch()..start();
+    final prepSw = Stopwatch()..start();
     try {
       final width = req.width;
       final height = req.height;
@@ -573,9 +609,9 @@ class _IsolateTFLiteEngine {
             final uvIndex = halfSrcY * req.uRowStride + halfSrcX * req.uPixelStride;
             final vIndex = halfSrcY * req.vRowStride + halfSrcX * req.vPixelStride;
 
-            final int yVal = (yIndex >= 0 && yIndex < yMax) ? yBytes[yIndex] : 128;
-            final int uByte = (uvIndex >= 0 && uvIndex < uMax) ? uBytes[uvIndex] : 128;
-            final int vByte = (vIndex >= 0 && vIndex < vMax) ? vBytes[vIndex] : 128;
+            final int yVal = (yIndex < yMax) ? yBytes[yIndex] : 128;
+            final int uByte = (uvIndex < uMax) ? uBytes[uvIndex] : 128;
+            final int vByte = (vIndex < vMax) ? vBytes[vIndex] : 128;
 
             final int y1024 = yVal << 10;
             final int rVal = ((y1024 + _rTableV[vByte]) >> 10).clamp(0, 255);
@@ -600,6 +636,7 @@ class _IsolateTFLiteEngine {
           }
         }
       }
+      prepSw.stop();
 
       // ZERO-COPY NATIVE TENSOR EXECUTION (< 1ms memory transfer)
       final inferSw = Stopwatch()..start();
@@ -615,13 +652,17 @@ class _IsolateTFLiteEngine {
       totalSw.stop();
 
       final totalMs = totalSw.elapsedMicroseconds / 1000.0;
+      final totalLatencyMs = req.submitTimeMs > 0
+          ? (DateTime.now().millisecondsSinceEpoch - req.submitTimeMs).toDouble()
+          : totalMs;
+
       decoded['metrics'] = {
         'fps': totalMs > 0 ? 1000.0 / totalMs : 0.0,
         'totalMs': totalMs,
+        'prepMs': prepSw.elapsedMicroseconds / 1000.0,
         'inferenceMs': inferSw.elapsedMicroseconds / 1000.0,
         'decodeMs': postSw.elapsedMicroseconds / 1000.0,
-        'maskMs': 0.0,
-        'contourMs': 0.0,
+        'totalLatencyMs': totalLatencyMs,
         'backend': _activeBackend,
         'confidence': decoded['confidence'],
         'hasDocument': decoded['isValid'],

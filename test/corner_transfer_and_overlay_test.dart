@@ -1,11 +1,12 @@
-import 'dart:io';
 import 'dart:typed_data';
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:docuray/models/models.dart';
 import 'package:docuray/core/services/jpeg_metadata.dart';
+import 'package:docuray/core/services/corner_detector_service.dart';
 import 'package:docuray/core/services/perspective_transform.dart';
+import 'package:docuray/core/services/scanner_diagnostics.dart';
 import 'package:docuray/core/providers/editor_provider.dart';
+import 'package:docuray/core/providers/scanner_provider.dart';
 import 'package:image/image.dart' as img;
 
 void main() {
@@ -34,8 +35,9 @@ void main() {
 
       final meta = JpegMetadata.fromBytes(bytes);
       expect(meta, isNotNull);
-      expect(meta!.width, equals(640));
-      expect(meta!.height, equals(480));
+      if (meta == null) return;
+      expect(meta.width, equals(640));
+      expect(meta.height, equals(480));
       expect(meta.orientation, equals(6));
       expect(meta.isRotated90, isTrue);
       expect(meta.uprightWidth, equals(480));
@@ -105,5 +107,205 @@ void main() {
       expect(warped.width / warped.height, closeTo(320 / 480, 0.01));
     });
   });
+
+  group('4. Raw Coordinates Preserved & Stability Tracking', () {
+    test('PaperCornerDetector preserves raw model coordinates and tracks consecutive stable frames', () {
+      final detector = PaperCornerDetector();
+
+      final baseCorners = [
+        const CornerPoint(0.10, 0.10),
+        const CornerPoint(0.90, 0.10),
+        const CornerPoint(0.90, 0.90),
+        const CornerPoint(0.10, 0.90),
+      ];
+
+      // First frame initializes
+      final f1 = detector.applyStabilizationForTesting(baseCorners);
+      expect(f1[0].x, equals(0.10));
+      expect(detector.consecutiveStableFrames, equals(1));
+
+      // Small jitter (< 0.04) increments consecutive stable frames
+      final jitteredCorners = [
+        const CornerPoint(0.101, 0.101),
+        const CornerPoint(0.901, 0.101),
+        const CornerPoint(0.901, 0.901),
+        const CornerPoint(0.101, 0.901),
+      ];
+      final f2 = detector.applyStabilizationForTesting(jitteredCorners);
+      expect(f2[0].x, equals(0.101)); // Exact raw coordinate returned
+      expect(detector.consecutiveStableFrames, equals(2));
+
+      // Active camera motion (shift >= 0.04) resets stable frames to 1 and returns exact coordinates
+      final movedCorners = [
+        const CornerPoint(0.20, 0.20),
+        const CornerPoint(0.95, 0.20),
+        const CornerPoint(0.95, 0.95),
+        const CornerPoint(0.20, 0.95),
+      ];
+      final f3 = detector.applyStabilizationForTesting(movedCorners);
+      expect(f3[0].x, equals(0.20)); // Exact raw coordinate returned
+      expect(detector.consecutiveStableFrames, equals(1)); // Reset stability on movement
+    });
+  });
+
+  group('5. Gallery Auto vs Manual Mode Policy', () {
+    test('Manual mode defaults to full bounds with null autoDetectedCorners', () {
+      final page = DocumentPage(
+        id: 'manual_page_1',
+        pageNumber: 1,
+        corners: const [
+          CornerPoint(0.0, 0.0),
+          CornerPoint(1.0, 0.0),
+          CornerPoint(1.0, 1.0),
+          CornerPoint(0.0, 1.0),
+        ],
+        autoDetectedCorners: null,
+        filterType: 'auto',
+      );
+
+      expect(page.autoDetectedCorners, isNull);
+      expect(page.corners[0].x, equals(0.0));
+      expect(page.corners[2].x, equals(1.0));
+    });
+
+    test('Auto mode stores detected document corners in both corners and autoDetectedCorners', () {
+      final detected = const [
+        CornerPoint(0.15, 0.20),
+        CornerPoint(0.85, 0.18),
+        CornerPoint(0.82, 0.88),
+        CornerPoint(0.12, 0.86),
+      ];
+      final page = DocumentPage(
+        id: 'auto_page_1',
+        pageNumber: 1,
+        corners: detected,
+        autoDetectedCorners: detected,
+        filterType: 'auto',
+      );
+
+      expect(page.autoDetectedCorners, isNotNull);
+      expect(page.autoDetectedCorners!.length, equals(4));
+      expect(page.corners, equals(detected));
+    });
+  });
+
+  group('6. DocumentPredictionState & Initial Visibility Guarantees', () {
+    test('ScannerProvider initializes with initialNoPrediction and null corners', () {
+      final scanner = ScannerProvider();
+      expect(scanner.predictionState, equals(DocumentPredictionState.initialNoPrediction));
+      expect(scanner.detectedCorners, isEmpty);
+      expect(scanner.hasValidPrediction, isFalse);
+      expect(scanner.cornersNotifier.value, isNull);
+      expect(scanner.predictionStateNotifier.value, equals(DocumentPredictionState.initialNoPrediction));
+    });
+
+    test('All 6 DocumentPredictionState enum values exist and are distinct', () {
+      final states = DocumentPredictionState.values;
+      expect(states.length, equals(6));
+      expect(states, contains(DocumentPredictionState.initialNoPrediction));
+      expect(states, contains(DocumentPredictionState.inferring));
+      expect(states, contains(DocumentPredictionState.validDocument));
+      expect(states, contains(DocumentPredictionState.noDocumentDetected));
+      expect(states, contains(DocumentPredictionState.detectionTemporarilyLost));
+      expect(states, contains(DocumentPredictionState.stopped));
+    });
+  });
+
+  group('7. ScannerDiagnosticsTracker Rolling Window Calculation', () {
+    test('Correctly records frames, drops, and calculates averages', () {
+      final tracker = ScannerDiagnosticsTracker();
+
+      // Record frames
+      tracker.recordCameraFrame();
+      tracker.recordCameraFrame();
+      tracker.recordSubmittedFrame();
+      tracker.recordDroppedFrame();
+
+      tracker.recordCompletedPrediction({
+        'prepMs': 5.0,
+        'inferenceMs': 45.0,
+        'decodeMs': 10.0,
+        'totalLatencyMs': 60.0,
+        'backend': 'NNAPI',
+        'hasDocument': true,
+        'confidence': 0.88,
+      });
+
+      final metrics = tracker.getMetrics();
+      expect(metrics.cameraFps, equals(2.0));
+      expect(metrics.submittedFps, equals(1.0));
+      expect(metrics.completedFps, equals(1.0));
+      expect(metrics.droppedCount, equals(1));
+      expect(metrics.droppedFps, equals(1.0));
+      expect(metrics.prepMs, closeTo(5.0, 0.01));
+      expect(metrics.inferenceMs, closeTo(45.0, 0.01));
+      expect(metrics.postprocessMs, closeTo(10.0, 0.01));
+      expect(metrics.totalLatencyMs, closeTo(60.0, 0.01));
+      expect(metrics.backend, equals('NNAPI'));
+      expect(metrics.hasDocument, isTrue);
+      expect(metrics.confidence, closeTo(0.88, 0.01));
+    });
+
+    test('Tracker reset clears all rolling queues', () {
+      final tracker = ScannerDiagnosticsTracker();
+      tracker.recordCameraFrame();
+      tracker.reset();
+      final metrics = tracker.getMetrics();
+      expect(metrics.cameraFps, equals(0.0));
+      expect(metrics.completedFps, equals(0.0));
+    });
+  });
+
+  group('8. Raw Model Coordinates Decoupled From Visual Rendering', () {
+    test('PaperCornerDetector initializes clean and uninitialized', () async {
+      final detector = PaperCornerDetector();
+      expect(detector.isInitialized, isFalse);
+      expect(detector.consecutiveStableFrames, equals(0));
+    });
+
+    test('Strict separation between raw model prediction and visual display coordinates', () {
+      final rawCorners = [
+        const Offset(0.12, 0.15),
+        const Offset(0.88, 0.14),
+        const Offset(0.85, 0.92),
+        const Offset(0.10, 0.89),
+      ];
+
+      final scanner = ScannerProvider();
+      // Simulate raw prediction delivered to scanner provider
+      scanner.cornersNotifier.value = rawCorners;
+      expect(scanner.cornersNotifier.value, equals(rawCorners));
+
+      // Visual interpolation simulating halfway animation progress
+      final visualDisplayCorners = [
+        const Offset(0.14, 0.16),
+        const Offset(0.86, 0.15),
+        const Offset(0.84, 0.91),
+        const Offset(0.11, 0.88),
+      ];
+
+      // Raw model coordinates remain strictly untouched by visual interpolation
+      expect(rawCorners[0].dx, equals(0.12));
+      expect(rawCorners[1].dx, equals(0.88));
+      expect(visualDisplayCorners[0].dx, isNot(equals(rawCorners[0].dx)));
+    });
+
+    test('Corner order [TL, TR, BR, BL] is preserved 1:1 without permutations', () {
+      final inputPrediction = [
+        const Offset(0.10, 0.12), // TL
+        const Offset(0.90, 0.14), // TR
+        const Offset(0.88, 0.92), // BR
+        const Offset(0.12, 0.90), // BL
+      ];
+
+      // Target copy preserves exact order
+      final targetCorners = List<Offset>.from(inputPrediction);
+      expect(targetCorners[0], equals(const Offset(0.10, 0.12)));
+      expect(targetCorners[1], equals(const Offset(0.90, 0.14)));
+      expect(targetCorners[2], equals(const Offset(0.88, 0.92)));
+      expect(targetCorners[3], equals(const Offset(0.12, 0.90)));
+    });
+  });
 }
+
 

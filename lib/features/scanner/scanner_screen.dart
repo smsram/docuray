@@ -157,8 +157,12 @@ class _ScannerScreenState extends State<ScannerScreen>
       final pages = await scanner.importFromGallery();
       if (pages.isNotEmpty && mounted) {
         _isNavigating = true;
-        for (final p in pages) {
-          editor.addPage(p);
+        if (editor.pages.isEmpty) {
+          editor.initializeWithPages(pages);
+        } else {
+          for (final p in pages) {
+            editor.addPage(p);
+          }
         }
         if (mounted) {
           await context.push(AppRouter.editor);
@@ -531,21 +535,13 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 
   Widget _buildDiagnosticsHud(Map<String, dynamic> m) {
-    final fps = (m['fps'] as num?)?.toDouble() ?? 0.0;
-    final totalMs = (m['totalMs'] as num?)?.toDouble() ?? 0.0;
-    final inferMs = (m['inferenceMs'] as num?)?.toDouble() ?? 0.0;
-    final decodeMs = (m['decodeMs'] as num?)?.toDouble() ?? 0.0;
-    final maskMs = (m['maskMs'] as num?)?.toDouble() ?? 0.0;
-    final contourMs = (m['contourMs'] as num?)?.toDouble() ?? 0.0;
-    final postMs = decodeMs + maskMs + contourMs;
-    final backend = m['backend'] as String? ?? 'CPU';
-    final conf = ((m['confidence'] as num?)?.toDouble() ?? 0.0) * 100;
-    final hasDoc = m['hasDocument'] as bool? ?? false;
+    final scanner = context.read<ScannerProvider>();
+    final perf = scanner.performanceMetrics;
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: Colors.black.withAlpha(200),
+        color: Colors.black.withAlpha(220),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: Colors.white24, width: 1),
       ),
@@ -557,7 +553,7 @@ class _ScannerScreenState extends State<ScannerScreen>
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                'FPS: ${fps.toStringAsFixed(1)} | Total: ${totalMs.toStringAsFixed(1)}ms',
+                'Cam: ${perf.cameraFps.toStringAsFixed(0)}fps | Pred: ${perf.completedFps.toStringAsFixed(1)}fps | Sub: ${perf.submittedFps.toStringAsFixed(1)}fps',
                 style: const TextStyle(
                   color: Colors.greenAccent,
                   fontSize: 11,
@@ -566,7 +562,7 @@ class _ScannerScreenState extends State<ScannerScreen>
                 ),
               ),
               Text(
-                backend,
+                perf.backend,
                 style: const TextStyle(
                   color: Colors.cyanAccent,
                   fontSize: 11,
@@ -577,7 +573,7 @@ class _ScannerScreenState extends State<ScannerScreen>
           ),
           const SizedBox(height: 2),
           Text(
-            'Inf: ${inferMs.toStringAsFixed(1)}ms | Post: ${postMs.toStringAsFixed(1)}ms | Conf: ${conf.toStringAsFixed(0)}% | Quad: ${hasDoc ? "YES" : "NO"}',
+            'Prep: ${perf.prepMs.toStringAsFixed(1)}ms | Inf: ${perf.inferenceMs.toStringAsFixed(1)}ms | Post: ${perf.postprocessMs.toStringAsFixed(1)}ms | Lat: ${perf.totalLatencyMs.toStringAsFixed(1)}ms | Drop: ${perf.droppedFps.toStringAsFixed(0)}/s | Doc: ${perf.hasDocument ? "YES" : "NO"}',
             style: const TextStyle(
               color: Colors.white70,
               fontSize: 10,
@@ -653,16 +649,28 @@ class _ScannerScreenState extends State<ScannerScreen>
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
-                    CameraPreview(scanner.cameraController!),
-                    _SmoothCornerOverlay(
-                      targetCorners: scanner.detectedCorners,
-                      isTracking: scanner.state == ScannerState.detected ||
-                          scanner.state == ScannerState.holdSteady ||
-                          scanner.state == ScannerState.ready ||
-                          scanner.state == ScannerState.capturing,
-                      isReady: scanner.state == ScannerState.ready,
-                      pulseValue: _pulseController.value,
-                      captureType: scanner.captureType,
+                    RepaintBoundary(
+                      child: CameraPreview(scanner.cameraController!),
+                    ),
+                    RepaintBoundary(
+                      child: ValueListenableBuilder<List<Offset>?>(
+                        valueListenable: scanner.cornersNotifier,
+                        builder: (context, corners, _) {
+                          final bool isTracking = corners != null &&
+                              corners.length == 4 &&
+                              (scanner.state == ScannerState.detected ||
+                                  scanner.state == ScannerState.holdSteady ||
+                                  scanner.state == ScannerState.ready ||
+                                  scanner.state == ScannerState.capturing);
+                          return _SmoothCornerOverlay(
+                            targetCorners: corners ?? const [],
+                            isTracking: isTracking,
+                            isReady: scanner.state == ScannerState.ready,
+                            pulseValue: _pulseController.value,
+                            captureType: scanner.captureType,
+                          );
+                        },
+                      ),
                     ),
                   ],
                 ),
@@ -750,10 +758,16 @@ class _SmoothCornerOverlay extends StatefulWidget {
 class _SmoothCornerOverlayState extends State<_SmoothCornerOverlay>
     with SingleTickerProviderStateMixin {
   late final AnimationController _tickerController;
-  DateTime _lastFrameTime = DateTime.now();
 
+  // Visual display coordinates (used exclusively for rendering the 4 visual corner dots)
   List<Offset> _currentCorners = [];
+
+  // Timestamp-based interpolation state: start -> target with dynamic interval adaptation
+  List<Offset> _animStartCorners = [];
   List<Offset> _targetCorners = [];
+  DateTime _animStartTime = DateTime.now();
+  int _animDurationMs = 110;
+  DateTime _lastPredictionTime = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastValidDetectionTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
@@ -761,7 +775,7 @@ class _SmoothCornerOverlayState extends State<_SmoothCornerOverlay>
     super.initState();
     _initCorners(widget.targetCorners);
 
-    // Continuous vsync ticker for 60fps/120fps fluid independent corner movement
+    // Continuous vsync ticker for fluid independent corner movement
     _tickerController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 1),
@@ -770,29 +784,53 @@ class _SmoothCornerOverlayState extends State<_SmoothCornerOverlay>
   }
 
   void _initCorners(List<Offset> corners) {
-    if (corners.length >= 4) {
+    if (corners.length >= 4 && widget.isTracking) {
       _currentCorners = List.from(corners);
+      _animStartCorners = List.from(corners);
       _targetCorners = List.from(corners);
       _lastValidDetectionTime = DateTime.now();
+      _lastPredictionTime = DateTime.now();
     } else {
-      _currentCorners = const [
-        Offset(0.08, 0.08),
-        Offset(0.92, 0.08),
-        Offset(0.92, 0.92),
-        Offset(0.08, 0.92),
-      ];
-      _targetCorners = List.from(_currentCorners);
+      // Do NOT initialize with placeholder coordinates
+      _currentCorners = [];
+      _animStartCorners = [];
+      _targetCorners = [];
+      _lastValidDetectionTime = DateTime.fromMillisecondsSinceEpoch(0);
     }
   }
 
   @override
   void didUpdateWidget(covariant _SmoothCornerOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.targetCorners.length >= 4) {
-      _targetCorners = List.from(widget.targetCorners);
-      if (widget.isTracking) {
-        _lastValidDetectionTime = DateTime.now();
+    final now = DateTime.now();
+
+    if (widget.targetCorners.length >= 4 && widget.isTracking) {
+      final bool wasNotTracking = !oldWidget.isTracking || _currentCorners.length < 4;
+      final bool longTimeNoDetection = now.difference(_lastValidDetectionTime).inMilliseconds > 250;
+
+      if (wasNotTracking || longTimeNoDetection) {
+        // Immediate visual lock-on: first valid prediction sets exact positions with zero delay
+        _currentCorners = List.from(widget.targetCorners);
+        _animStartCorners = List.from(widget.targetCorners);
+        _targetCorners = List.from(widget.targetCorners);
+        _animStartTime = now;
+        _animDurationMs = 100;
+      } else {
+        // Smooth redirection: seamlessly start from current displayed position toward newest target
+        _animStartCorners = List.from(_currentCorners);
+        // Preserve exact [TL, TR, BR, BL] corner order without permutations
+        _targetCorners = List.from(widget.targetCorners);
+
+        // Adapt animation duration to actual prediction interval (typically 80-130ms at 8-12 FPS)
+        if (_lastPredictionTime.millisecondsSinceEpoch > 0) {
+          final interval = now.difference(_lastPredictionTime).inMilliseconds;
+          _animDurationMs = interval.clamp(70, 160);
+        }
+        _animStartTime = now;
       }
+
+      _lastPredictionTime = now;
+      _lastValidDetectionTime = now;
     }
   }
 
@@ -803,52 +841,58 @@ class _SmoothCornerOverlayState extends State<_SmoothCornerOverlay>
   }
 
   void _onTick() {
+    if (_currentCorners.length < 4 || _targetCorners.length < 4 || _animStartCorners.length < 4) {
+      return;
+    }
+
     final now = DateTime.now();
-    final dt = now.difference(_lastFrameTime).inMicroseconds / 1000000.0;
-    _lastFrameTime = now;
-
-    if (dt <= 0.0 || dt > 0.1) return;
-
-    // Independent smooth exponential pursuit towards target (rate: ~22.0/s)
-    // Smooths out high-frequency sensor noise while responding instantly to camera movement
-    final factor = (1.0 - math.exp(-22.0 * dt)).clamp(0.05, 1.0);
+    final elapsedMs = now.difference(_animStartTime).inMilliseconds;
+    final progress = (elapsedMs / _animDurationMs).clamp(0.0, 1.0);
+    final eased = Curves.easeOutCubic.transform(progress);
 
     bool moved = false;
-    for (int i = 0; i < 4 && i < _currentCorners.length && i < _targetCorners.length; i++) {
-      final cur = _currentCorners[i];
-      final tgt = _targetCorners[i];
-      final dx = tgt.dx - cur.dx;
-      final dy = tgt.dy - cur.dy;
+    for (int i = 0; i < 4; i++) {
+      final start = _animStartCorners[i];
+      final target = _targetCorners[i];
+      final newX = start.dx + (target.dx - start.dx) * eased;
+      final newY = start.dy + (target.dy - start.dy) * eased;
 
-      if (dx.abs() > 0.0001 || dy.abs() > 0.0001) {
-        _currentCorners[i] = Offset(
-          cur.dx + dx * factor,
-          cur.dy + dy * factor,
-        );
+      if ((newX - _currentCorners[i].dx).abs() > 0.0001 ||
+          (newY - _currentCorners[i].dy).abs() > 0.0001) {
+        _currentCorners[i] = Offset(newX, newY);
         moved = true;
       }
     }
 
-    if (moved && mounted) {
+    final bool hasCorners = _currentCorners.length == 4;
+    final bool shouldShow = hasCorners &&
+        (widget.isTracking || now.difference(_lastValidDetectionTime).inMilliseconds < 250);
+
+    if (mounted && (moved || shouldShow)) {
       setState(() {});
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    // Graceful momentary loss handling: retain visible corners for up to 350ms before fading out
-    final timeSinceDetection = DateTime.now().difference(_lastValidDetectionTime).inMilliseconds;
-    final bool shouldShow = widget.isTracking || timeSinceDetection < 350;
+    final now = DateTime.now();
+    final timeSinceDetection = now.difference(_lastValidDetectionTime).inMilliseconds;
+    final bool hasCorners = _currentCorners.length == 4;
+    // Show ONLY when actual valid corners exist and either actively tracking or within brief 250ms grace window
+    final bool shouldShow = hasCorners && (widget.isTracking || timeSinceDetection < 250);
+
+    // Continuous 60/120fps independent smooth sinusoidal pulse
+    final pulseValue = 0.5 + 0.5 * math.sin((now.millisecondsSinceEpoch % 1400) / 1400.0 * 2.0 * math.pi);
 
     return AnimatedOpacity(
       opacity: shouldShow ? 1.0 : 0.0,
-      duration: const Duration(milliseconds: 220),
+      duration: const Duration(milliseconds: 180),
       curve: Curves.easeOut,
       child: CustomPaint(
         painter: _CornerDetectionPainter(
           corners: _currentCorners,
           isReady: widget.isReady,
-          pulseValue: widget.pulseValue,
+          pulseValue: pulseValue,
           captureType: widget.captureType,
           isTracking: shouldShow,
         ),

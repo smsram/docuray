@@ -8,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../../models/models.dart';
 import '../services/corner_detector_service.dart';
 import '../services/jpeg_metadata.dart';
+import '../services/scanner_diagnostics.dart';
 
 enum ScannerState {
   searching,
@@ -27,6 +28,27 @@ enum QualityIssue {
   tooDark,
 }
 
+/// Explicit lifecycle states for document prediction validity
+enum DocumentPredictionState {
+  /// 1. Camera initialized, no prediction yet received from model
+  initialNoPrediction,
+
+  /// 2. Inference currently executing in background
+  inferring,
+
+  /// 3. Valid document prediction received from the model
+  validDocument,
+
+  /// 4. Completed inference with no valid document found
+  noDocumentDetected,
+
+  /// 5. Detection temporarily lost (within brief 250ms grace period to prevent flicker)
+  detectionTemporarilyLost,
+
+  /// 6. Camera stopped, paused, or scanner disposed
+  stopped,
+}
+
 class ScannerProvider extends ChangeNotifier {
   final PaperCornerDetector _cornerDetector = PaperCornerDetector();
 
@@ -40,6 +62,8 @@ class ScannerProvider extends ChangeNotifier {
   bool _isInitializing = false;
   bool _permissionDenied = false;
   bool _isStreaming = false;
+  bool _isCameraActive = false;
+  bool _isDisposed = false;
 
   ScannerState _state = ScannerState.searching;
   QualityIssue _qualityIssue = QualityIssue.moveCloser;
@@ -48,20 +72,30 @@ class ScannerProvider extends ChangeNotifier {
   String _captureMode = 'Auto';
   String _captureType = 'Document';
 
+  // Prediction Lifecycle State Management
+  DocumentPredictionState _predictionState = DocumentPredictionState.initialNoPrediction;
+  bool _hasValidPrediction = false;
+  bool _hasEverReceivedValidPrediction = false;
+  DateTime? _lastValidPredictionTime;
+
+  bool _isProcessingFrame = false;
   bool _isDetecting = false;
   bool _isCapturing = false;
   bool _showDiagnostics = false;
   int _missedFramesCount = 0;
   Map<String, dynamic>? _diagnosticMetrics;
-  DateTime _lastInferenceTime = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime? _readyStartTime;
 
-  List<Offset> _detectedCorners = [
-    const Offset(0.08, 0.08),
-    const Offset(0.92, 0.08),
-    const Offset(0.92, 0.92),
-    const Offset(0.08, 0.92),
-  ];
+  CameraImage? _pendingFrame;
+  List<Offset>? _detectedCorners;
+
+  /// Isolated ValueNotifier for corner overlay updates (avoids full-screen rebuilds on every prediction)
+  final ValueNotifier<List<Offset>?> cornersNotifier = ValueNotifier<List<Offset>?>(null);
+  final ValueNotifier<DocumentPredictionState> predictionStateNotifier =
+      ValueNotifier<DocumentPredictionState>(DocumentPredictionState.initialNoPrediction);
+
+  /// Internal diagnostic performance tracker
+  final ScannerDiagnosticsTracker _diagnostics = ScannerDiagnosticsTracker();
 
   void Function(DocumentPage capturedPage)? onAutoCaptured;
 
@@ -77,10 +111,14 @@ class ScannerProvider extends ChangeNotifier {
   bool get isAutoCapture => _captureMode == 'Auto';
   String get captureType => _captureType;
   String get scanMode => _captureType;
-  List<Offset> get detectedCorners => _detectedCorners;
+  DocumentPredictionState get predictionState => _predictionState;
+  bool get hasValidPrediction => _hasValidPrediction;
+  List<Offset> get detectedCorners => _detectedCorners ?? const [];
   bool get isCapturing => _isCapturing;
+  bool get isDetecting => _isDetecting;
   bool get showDiagnostics => _showDiagnostics;
   Map<String, dynamic>? get diagnosticMetrics => _diagnosticMetrics;
+  ScannerPerformanceMetrics get performanceMetrics => _diagnostics.getMetrics();
 
   String get stateMessage {
     if (!isAutoCapture) {
@@ -311,24 +349,64 @@ class ScannerProvider extends ChangeNotifier {
 
     try {
       _isStreaming = true;
+      _isCameraActive = true;
       await _cameraController!.startImageStream((CameraImage image) {
-        _processPreviewFrame(image);
+        _onCameraFrame(image);
       });
     } catch (e) {
       debugPrint('[DocuRay] startImageStream error: $e');
       _isStreaming = false;
+      _isCameraActive = false;
     }
   }
 
-  void _processPreviewFrame(CameraImage image) async {
-    final now = DateTime.now();
-    if (_isDetecting || _isCapturing || now.difference(_lastInferenceTime).inMilliseconds < 35) {
+  /// High-throughput, latest-frame-only stream receiver
+  void _onCameraFrame(CameraImage image) {
+    if (_isDisposed) return;
+    _diagnostics.recordCameraFrame();
+
+    // Inference should continue ONLY when the camera is active and Auto mode is enabled
+    if (!isAutoCapture || _isCapturing || !_isCameraActive) {
       return;
     }
 
-    _isDetecting = true;
-    _lastInferenceTime = now;
+    if (_isProcessingFrame) {
+      // Discard previous pending frame (latest-frame-only policy)
+      if (_pendingFrame != null) {
+        _diagnostics.recordDroppedFrame();
+      }
+      _pendingFrame = image;
+      return;
+    }
 
+    _pendingFrame = image;
+    _scheduleNextInference();
+  }
+
+  void _scheduleNextInference() {
+    if (_isDisposed || _isProcessingFrame || _pendingFrame == null || !isAutoCapture || _isCapturing || !_isCameraActive) {
+      return;
+    }
+
+    final frameToProcess = _pendingFrame!;
+    _pendingFrame = null;
+    _isProcessingFrame = true;
+    _isDetecting = true;
+
+    _diagnostics.recordSubmittedFrame();
+
+    _runInferenceOnFrame(frameToProcess).then((_) {
+      _isProcessingFrame = false;
+      _isDetecting = false;
+
+      // Immediately process the freshest available frame that arrived during inference
+      if (!_isDisposed && _pendingFrame != null && isAutoCapture && !_isCapturing && _isCameraActive) {
+        _scheduleNextInference();
+      }
+    });
+  }
+
+  Future<void> _runInferenceOnFrame(CameraImage image) async {
     try {
       final sensorOrientation = _cameraController?.description.sensorOrientation ?? 90;
       final result = await _cornerDetector.detectCornersFromCameraImage(
@@ -336,13 +414,27 @@ class ScannerProvider extends ChangeNotifier {
         sensorOrientation: sensorOrientation,
       );
 
+      if (_isDisposed || !_isCameraActive || !isAutoCapture) return;
+
+      _diagnostics.recordCompletedPrediction(result.metrics);
       if (result.metrics != null) {
         _diagnosticMetrics = result.metrics;
       }
 
+      final oldState = _state;
+
       if (result.isValid) {
         _missedFramesCount = 0;
+        _hasValidPrediction = true;
+        _hasEverReceivedValidPrediction = true;
+        _lastValidPredictionTime = DateTime.now();
+        _predictionState = DocumentPredictionState.validDocument;
+
         _detectedCorners = result.corners.map((c) => Offset(c.x, c.y)).toList();
+
+        // Update isolated value notifiers (avoids rebuilding complete scanning screen)
+        cornersNotifier.value = _detectedCorners;
+        predictionStateNotifier.value = DocumentPredictionState.validDocument;
 
         final stableFrames = _cornerDetector.consecutiveStableFrames;
 
@@ -365,17 +457,44 @@ class ScannerProvider extends ChangeNotifier {
       } else {
         _missedFramesCount++;
         _readyStartTime = null;
-        if (_missedFramesCount >= 3) {
-          _state = ScannerState.searching;
+
+        final now = DateTime.now();
+        final msSinceValid = _lastValidPredictionTime != null
+            ? now.difference(_lastValidPredictionTime!).inMilliseconds
+            : 9999;
+
+        if (!_hasEverReceivedValidPrediction) {
+          _predictionState = DocumentPredictionState.initialNoPrediction;
+          _hasValidPrediction = false;
+          cornersNotifier.value = null;
+          predictionStateNotifier.value = _predictionState;
+        } else if (msSinceValid <= 250 && _missedFramesCount <= 2) {
+          // Grace period: prevent flickering from single dropped/missed detection
+          _predictionState = DocumentPredictionState.detectionTemporarilyLost;
+          predictionStateNotifier.value = _predictionState;
+        } else {
+          // Genuine loss: hide indicators and clear stabilization
+          _predictionState = DocumentPredictionState.noDocumentDetected;
+          _hasValidPrediction = false;
           _cornerDetector.resetStabilization();
+          cornersNotifier.value = null;
+          predictionStateNotifier.value = _predictionState;
+
+          if (_missedFramesCount >= 3) {
+            _state = ScannerState.searching;
+          }
+          if (_missedFramesCount > 6) {
+            _detectedCorners = null;
+          }
         }
       }
 
-      notifyListeners();
+      // ONLY rebuild scanning screen UI when the high-level scanner state actually changes!
+      if (_state != oldState) {
+        notifyListeners();
+      }
     } catch (e) {
       debugPrint('[DocuRay] Live frame processing error: $e');
-    } finally {
-      _isDetecting = false;
     }
   }
 
@@ -459,11 +578,13 @@ class ScannerProvider extends ChangeNotifier {
       _state = ScannerState.processing;
       notifyListeners();
 
-      // Retrieve live detected corners as the ground truth
-      final capturedCorners = List<Offset>.from(_detectedCorners);
-      final bool wasDetected = _state == ScannerState.ready ||
-          _state == ScannerState.holdSteady ||
-          _state == ScannerState.detected;
+      // Retrieve live detected corners as the ground truth ONLY if prediction is valid
+      final bool wasDetected = _hasValidPrediction &&
+          _detectedCorners != null &&
+          _detectedCorners!.length == 4 &&
+          (_state == ScannerState.ready ||
+              _state == ScannerState.holdSteady ||
+              _state == ScannerState.detected);
 
       // Extract photo dimensions and EXIF orientation without decoding full image
       final jpegInfo = await JpegMetadata.fromFile(File(xFile.path));
@@ -483,36 +604,47 @@ class ScannerProvider extends ChangeNotifier {
 
       final bool isFront = _cameraController!.description.lensDirection == CameraLensDirection.front;
 
-      // Transfer the exact four detected corner coordinates from scan screen to photo coordinates
-      final List<CornerPoint> finalCorners = capturedCorners.map((o) {
-        double nx = o.dx;
-        double ny = o.dy;
+      List<CornerPoint> finalCorners;
+      if (wasDetected) {
+        final capturedCorners = List<Offset>.from(_detectedCorners!);
+        finalCorners = capturedCorners.map((o) {
+          double nx = o.dx;
+          double ny = o.dy;
 
-        // Front camera mirroring
-        if (isFront) {
-          nx = 1.0 - nx;
-        }
-
-        // Adjust for aspect ratio difference if preview is cropped relative to sensor
-        if ((prevAspect - photoAspect).abs() > 0.005) {
-          if (prevAspect < photoAspect) {
-            // Preview is narrower than photo (cropped horizontally by CameraX)
-            nx = 0.5 + (nx - 0.5) * (prevAspect / photoAspect);
-          } else {
-            // Preview is wider than photo (cropped vertically by CameraX)
-            ny = 0.5 + (ny - 0.5) * (photoAspect / prevAspect);
+          // Front camera mirroring
+          if (isFront) {
+            nx = 1.0 - nx;
           }
-        }
 
-        return CornerPoint(nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0));
-      }).toList();
+          // Adjust for aspect ratio difference if preview is cropped relative to sensor
+          if ((prevAspect - photoAspect).abs() > 0.005) {
+            if (prevAspect < photoAspect) {
+              // Preview is narrower than photo (cropped horizontally by CameraX)
+              nx = 0.5 + (nx - 0.5) * (prevAspect / photoAspect);
+            } else {
+              // Preview is wider than photo (cropped vertically by CameraX)
+              ny = 0.5 + (ny - 0.5) * (photoAspect / prevAspect);
+            }
+          }
+
+          return CornerPoint(nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0));
+        }).toList();
+      } else {
+        // Fallback to full image bounds for manual or undetected captures
+        finalCorners = const [
+          CornerPoint(0.0, 0.0),
+          CornerPoint(1.0, 0.0),
+          CornerPoint(1.0, 1.0),
+          CornerPoint(0.0, 1.0),
+        ];
+      }
 
       final page = DocumentPage(
         id: 'page_${DateTime.now().millisecondsSinceEpoch}',
         pageNumber: 1,
         originalImagePath: xFile.path,
         corners: finalCorners,
-        autoDetectedCorners: (wasDetected || isAutoCapture) ? finalCorners : null,
+        autoDetectedCorners: wasDetected ? finalCorners : null,
         filterType: 'auto',
       );
 
@@ -539,6 +671,9 @@ class ScannerProvider extends ChangeNotifier {
     _state = ScannerState.processing;
     notifyListeners();
 
+    // Snapshot current capture mode before picker opens
+    final bool shouldRunDetection = isAutoCapture;
+
     try {
       final picker = ImagePicker();
       final pickedFiles = await picker.pickMultiImage();
@@ -553,18 +688,23 @@ class ScannerProvider extends ChangeNotifier {
       for (int i = 0; i < pickedFiles.length; i++) {
         final file = pickedFiles[i];
         DetectionResult? detection;
-        try {
-          detection = await _cornerDetector
-              .detectCornersFromPath(file.path)
-              .timeout(const Duration(seconds: 4));
-        } catch (e) {
-          debugPrint('[DocuRay] Corner detection timed out or failed for ${file.path}: $e');
+
+        // Apply corner detection for all selected images ONLY if Auto mode was active
+        if (shouldRunDetection) {
+          try {
+            detection = await _cornerDetector
+                .detectCornersFromPath(file.path)
+                .timeout(const Duration(seconds: 4));
+          } catch (e) {
+            debugPrint('[DocuRay] Corner detection timed out or failed for ${file.path}: $e');
+          }
         }
 
         List<CornerPoint> corners;
-        if (detection != null && detection.isValid && !detection.isTightlyFramed) {
+        if (shouldRunDetection && detection != null && detection.isValid && !detection.isTightlyFramed) {
           corners = detection.corners;
         } else {
+          // Manual mode or undetected document defaults to full uncropped image
           corners = const [
             CornerPoint(0.0, 0.0),
             CornerPoint(1.0, 0.0),
@@ -579,7 +719,7 @@ class ScannerProvider extends ChangeNotifier {
             pageNumber: i + 1,
             originalImagePath: file.path,
             corners: corners,
-            autoDetectedCorners: (detection != null && detection.isValid) ? corners : null,
+            autoDetectedCorners: (shouldRunDetection && detection != null && detection.isValid) ? corners : null,
             filterType: 'auto',
           ),
         );
@@ -604,6 +744,22 @@ class ScannerProvider extends ChangeNotifier {
   }
 
   Future<void> resumeCamera() async {
+    _isCameraActive = true;
+    _isCapturing = false;
+    _hasValidPrediction = false;
+    _hasEverReceivedValidPrediction = false;
+    _detectedCorners = null;
+    _lastValidPredictionTime = null;
+    _missedFramesCount = 0;
+    _predictionState = isAutoCapture
+        ? DocumentPredictionState.initialNoPrediction
+        : DocumentPredictionState.stopped;
+
+    cornersNotifier.value = null;
+    predictionStateNotifier.value = _predictionState;
+    _diagnostics.reset();
+    _cornerDetector.resetStabilization();
+
     if (useNativePlatformView && _nativeChannel != null) {
       try {
         await _nativeChannel!.invokeMethod('resumeScanner');
@@ -616,19 +772,25 @@ class ScannerProvider extends ChangeNotifier {
         await _cameraController!.resumePreview();
       } catch (_) {}
       if (!_isStreaming) {
-        _cornerDetector.resetStabilization();
         await _startImageStream();
       }
     }
     _state = ScannerState.searching;
-    _isCapturing = false;
     notifyListeners();
   }
 
   Future<void> pauseCamera() async {
+    _isCameraActive = false;
+    _pendingFrame = null;
+    _isProcessingFrame = false;
     _isDetecting = false;
     _isCapturing = false;
     _readyStartTime = null;
+    _predictionState = DocumentPredictionState.stopped;
+
+    cornersNotifier.value = null;
+    predictionStateNotifier.value = DocumentPredictionState.stopped;
+    _cornerDetector.resetStabilization();
 
     if (useNativePlatformView && _nativeChannel != null) {
       try {
@@ -649,7 +811,6 @@ class ScannerProvider extends ChangeNotifier {
       } catch (_) {}
     }
     _state = ScannerState.searching;
-    _cornerDetector.resetStabilization();
     notifyListeners();
   }
 
@@ -703,13 +864,14 @@ class ScannerProvider extends ChangeNotifier {
     _captureMode = mode;
     _readyStartTime = null;
 
-    if (_captureMode == 'Manual') {
-      _detectedCorners = const [
-        Offset(0.05, 0.05),
-        Offset(0.95, 0.05),
-        Offset(0.95, 0.95),
-        Offset(0.05, 0.95),
-      ];
+    if (!isAutoCapture) {
+      // Manual mode: cancel queued frames, clear indicators, pause model inference
+      _pendingFrame = null;
+      _hasValidPrediction = false;
+      _detectedCorners = null;
+      cornersNotifier.value = null;
+      _predictionState = DocumentPredictionState.stopped;
+      predictionStateNotifier.value = DocumentPredictionState.stopped;
       _state = ScannerState.searching;
       _cornerDetector.resetStabilization();
       if (useNativePlatformView && _nativeChannel != null) {
@@ -718,6 +880,12 @@ class ScannerProvider extends ChangeNotifier {
         } catch (_) {}
       }
     } else {
+      // Auto mode: start fresh with clean detection state
+      _hasValidPrediction = false;
+      _detectedCorners = null;
+      cornersNotifier.value = null;
+      _predictionState = DocumentPredictionState.initialNoPrediction;
+      predictionStateNotifier.value = DocumentPredictionState.initialNoPrediction;
       _state = ScannerState.searching;
       _cornerDetector.resetStabilization();
       if (useNativePlatformView && _nativeChannel != null) {
@@ -762,6 +930,9 @@ class ScannerProvider extends ChangeNotifier {
   }
 
   void disposeCamera() {
+    _isDisposed = true;
+    _isCameraActive = false;
+    _pendingFrame = null;
     if (_nativeChannel != null) {
       _nativeChannel!.setMethodCallHandler(null);
       _nativeChannel = null;
@@ -776,6 +947,8 @@ class ScannerProvider extends ChangeNotifier {
   @override
   void dispose() {
     disposeCamera();
+    cornersNotifier.dispose();
+    predictionStateNotifier.dispose();
     super.dispose();
   }
 }
