@@ -4,6 +4,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:image/image.dart' as img;
 import 'package:permission_handler/permission_handler.dart';
 import '../../models/models.dart';
 import '../services/corner_detector_service.dart';
@@ -561,6 +562,16 @@ class ScannerProvider extends ChangeNotifier {
       return null;
     }
 
+    // Retrieve live detected corners as the ground truth BEFORE changing state
+    final bool hadDetection = _hasValidPrediction &&
+        _detectedCorners != null &&
+        _detectedCorners!.length == 4 &&
+        (_state == ScannerState.ready ||
+            _state == ScannerState.holdSteady ||
+            _state == ScannerState.detected);
+    final List<Offset>? capturedCorners =
+        hadDetection ? List<Offset>.from(_detectedCorners!) : null;
+
     _isCapturing = true;
     _state = ScannerState.capturing;
     notifyListeners();
@@ -578,14 +589,6 @@ class ScannerProvider extends ChangeNotifier {
       _state = ScannerState.processing;
       notifyListeners();
 
-      // Retrieve live detected corners as the ground truth ONLY if prediction is valid
-      final bool wasDetected = _hasValidPrediction &&
-          _detectedCorners != null &&
-          _detectedCorners!.length == 4 &&
-          (_state == ScannerState.ready ||
-              _state == ScannerState.holdSteady ||
-              _state == ScannerState.detected);
-
       // Extract photo dimensions and EXIF orientation without decoding full image
       final jpegInfo = await JpegMetadata.fromFile(File(xFile.path));
 
@@ -600,21 +603,42 @@ class ScannerProvider extends ChangeNotifier {
           ? (previewSize?.width ?? 1280.0)
           : (previewSize?.height ?? 720.0);
       final double prevAspect = prevW / prevH;
-      final double photoAspect = jpegInfo?.uprightAspectRatio ?? prevAspect;
+
+      double photoAspect = prevAspect;
+      if (jpegInfo != null && jpegInfo.uprightWidth > 0 && jpegInfo.uprightHeight > 0) {
+        photoAspect = jpegInfo.uprightAspectRatio;
+      } else {
+        try {
+          final bytes = await File(xFile.path).readAsBytes();
+          final decoded = img.decodeImage(bytes);
+          if (decoded != null) {
+            final oriented = img.bakeOrientation(decoded);
+            if (oriented.width > 0 && oriented.height > 0) {
+              photoAspect = oriented.width / oriented.height;
+            }
+          }
+        } catch (_) {}
+      }
 
       final bool isFront = _cameraController!.description.lensDirection == CameraLensDirection.front;
 
       List<CornerPoint> finalCorners;
-      if (wasDetected) {
-        final capturedCorners = List<Offset>.from(_detectedCorners!);
-        finalCorners = capturedCorners.map((o) {
+      if (hadDetection && capturedCorners != null && capturedCorners.length == 4) {
+        var cornersToMap = capturedCorners;
+
+        // Front camera mirroring: flip horizontally and preserve [TL, TR, BR, BL] order
+        if (isFront) {
+          cornersToMap = [
+            Offset(1.0 - cornersToMap[1].dx, cornersToMap[1].dy),
+            Offset(1.0 - cornersToMap[0].dx, cornersToMap[0].dy),
+            Offset(1.0 - cornersToMap[3].dx, cornersToMap[3].dy),
+            Offset(1.0 - cornersToMap[2].dx, cornersToMap[2].dy),
+          ];
+        }
+
+        finalCorners = cornersToMap.map((o) {
           double nx = o.dx;
           double ny = o.dy;
-
-          // Front camera mirroring
-          if (isFront) {
-            nx = 1.0 - nx;
-          }
 
           // Adjust for aspect ratio difference if preview is cropped relative to sensor
           if ((prevAspect - photoAspect).abs() > 0.005) {
@@ -644,7 +668,7 @@ class ScannerProvider extends ChangeNotifier {
         pageNumber: 1,
         originalImagePath: xFile.path,
         corners: finalCorners,
-        autoDetectedCorners: wasDetected ? finalCorners : null,
+        autoDetectedCorners: hadDetection ? finalCorners : null,
         filterType: 'auto',
       );
 
@@ -700,18 +724,15 @@ class ScannerProvider extends ChangeNotifier {
           }
         }
 
-        List<CornerPoint> corners;
-        if (shouldRunDetection && detection != null && detection.isValid && !detection.isTightlyFramed) {
-          corners = detection.corners;
-        } else {
-          // Manual mode or undetected document defaults to full uncropped image
-          corners = const [
-            CornerPoint(0.0, 0.0),
-            CornerPoint(1.0, 0.0),
-            CornerPoint(1.0, 1.0),
-            CornerPoint(0.0, 1.0),
-          ];
-        }
+        final bool hasValidDoc = shouldRunDetection && detection != null && detection.isValid;
+        final List<CornerPoint> corners = hasValidDoc
+            ? detection.corners
+            : const [
+                CornerPoint(0.0, 0.0),
+                CornerPoint(1.0, 0.0),
+                CornerPoint(1.0, 1.0),
+                CornerPoint(0.0, 1.0),
+              ];
 
         pages.add(
           DocumentPage(
@@ -719,7 +740,7 @@ class ScannerProvider extends ChangeNotifier {
             pageNumber: i + 1,
             originalImagePath: file.path,
             corners: corners,
-            autoDetectedCorners: (shouldRunDetection && detection != null && detection.isValid) ? corners : null,
+            autoDetectedCorners: hasValidDoc ? corners : null,
             filterType: 'auto',
           ),
         );

@@ -8,6 +8,7 @@ import '../../core/providers/editor_provider.dart';
 import '../../core/providers/documents_provider.dart';
 import '../../core/providers/scanner_provider.dart';
 import '../../core/providers/settings_provider.dart';
+import '../../core/services/jpeg_metadata.dart';
 import '../../core/services/pdf_generator_service.dart';
 import '../../core/routing/app_router.dart';
 import '../../core/widgets/document_thumbnail.dart';
@@ -45,10 +46,22 @@ class _EditorScreenState extends State<EditorScreen> {
     }
   }
 
+  String? _lastResolvedPath;
+
   void _resolveSourceImageAspectRatio(String? path) {
-    if (path == null) return;
+    if (path == null || path == _lastResolvedPath) return;
+    _lastResolvedPath = path;
     final file = File(path);
     if (!file.existsSync()) return;
+
+    // Fast header inspection for instantaneous aspect ratio
+    JpegMetadata.fromFile(file).then((meta) {
+      if (meta != null && meta.uprightWidth > 0 && meta.uprightHeight > 0 && mounted) {
+        setState(() {
+          _sourceAspectRatio = meta.uprightAspectRatio;
+        });
+      }
+    });
 
     _imageStreamListener?.let((l) => _imageStream?.removeListener(l));
     final stream = FileImage(file).resolve(const ImageConfiguration());
@@ -488,6 +501,7 @@ class _EditorScreenState extends State<EditorScreen> {
     // overlaying the exact 4 draggable corner and edge handles.
     if (editor.activeTool == EditorActiveTool.crop) {
       if (page?.originalImagePath != null && File(page!.originalImagePath!).existsSync()) {
+        _resolveSourceImageAspectRatio(page.originalImagePath);
         final maxW = constraints.maxWidth * 0.95;
         final maxH = constraints.maxHeight * 0.95;
         final boxAspect = maxW / maxH;

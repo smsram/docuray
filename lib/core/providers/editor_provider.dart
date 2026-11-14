@@ -353,6 +353,11 @@ class EditorProvider extends ChangeNotifier {
   }
 
   void addPage(DocumentPage page) {
+    if (_documentTitle.isEmpty) {
+      final now = DateTime.now();
+      _documentTitle =
+          'Scan ${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')} ${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+    }
     final newPageNumber = _pages.length + 1;
     _pages.add(page.copyWith(pageNumber: newPageNumber));
     _currentPageIndex = _pages.length - 1;

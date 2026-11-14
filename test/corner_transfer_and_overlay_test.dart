@@ -306,6 +306,154 @@ void main() {
       expect(targetCorners[3], equals(const Offset(0.12, 0.90)));
     });
   });
+
+  group('9. Camera Capture Coordinate Transformation & Mirroring', () {
+    test('Calculates horizontal aspect ratio compensation when preview is narrower than sensor', () {
+      const prevAspect = 720.0 / 1280.0; // 0.5625
+      const photoAspect = 3000.0 / 4000.0; // 0.75
+      final previewCorners = [
+        const Offset(0.0, 0.1), // Left edge in preview
+        const Offset(1.0, 0.1), // Right edge in preview
+        const Offset(1.0, 0.9),
+        const Offset(0.0, 0.9),
+      ];
+
+      final mapped = previewCorners.map((o) {
+        double nx = o.dx;
+        double ny = o.dy;
+        if ((prevAspect - photoAspect).abs() > 0.005) {
+          if (prevAspect < photoAspect) {
+            nx = 0.5 + (nx - 0.5) * (prevAspect / photoAspect);
+          } else {
+            ny = 0.5 + (ny - 0.5) * (photoAspect / prevAspect);
+          }
+        }
+        return CornerPoint(nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0));
+      }).toList();
+
+      // In 3000x4000 photo, centered 2250x4000 crop starts at 375px (0.125) and ends at 2625px (0.875)
+      expect(mapped[0].x, closeTo(0.125, 1e-4));
+      expect(mapped[1].x, closeTo(0.875, 1e-4));
+      expect(mapped[2].x, closeTo(0.875, 1e-4));
+      expect(mapped[3].x, closeTo(0.125, 1e-4));
+      // Y remains uncompressed
+      expect(mapped[0].y, closeTo(0.1, 1e-4));
+      expect(mapped[2].y, closeTo(0.9, 1e-4));
+    });
+
+    test('Front camera mirroring flips horizontally and maintains [TL, TR, BR, BL] ordering', () {
+      final previewCorners = [
+        const Offset(0.2, 0.1), // TL in mirrored preview
+        const Offset(0.8, 0.15), // TR in mirrored preview
+        const Offset(0.75, 0.85), // BR in mirrored preview
+        const Offset(0.25, 0.8), // BL in mirrored preview
+      ];
+
+      // Mirror mapping: x -> 1 - x, swap TL <-> TR and BL <-> BR
+      final mirrored = [
+        Offset(1.0 - previewCorners[1].dx, previewCorners[1].dy), // TR becomes TL
+        Offset(1.0 - previewCorners[0].dx, previewCorners[0].dy), // TL becomes TR
+        Offset(1.0 - previewCorners[3].dx, previewCorners[3].dy), // BL becomes BR
+        Offset(1.0 - previewCorners[2].dx, previewCorners[2].dy), // BR becomes BL
+      ];
+
+      // Point 0 (TL) was preview TR (0.8, 0.15) -> 1 - 0.8 = 0.2, 0.15
+      expect(mirrored[0].dx, closeTo(0.2, 1e-4));
+      expect(mirrored[0].dy, closeTo(0.15, 1e-4));
+
+      // Point 1 (TR) was preview TL (0.2, 0.1) -> 1 - 0.2 = 0.8, 0.1
+      expect(mirrored[1].dx, closeTo(0.8, 1e-4));
+      expect(mirrored[1].dy, closeTo(0.1, 1e-4));
+
+      // Point 2 (BR) was preview BL (0.25, 0.8) -> 1 - 0.25 = 0.75, 0.8
+      expect(mirrored[2].dx, closeTo(0.75, 1e-4));
+      expect(mirrored[2].dy, closeTo(0.8, 1e-4));
+
+      // Point 3 (BL) was preview BR (0.75, 0.85) -> 1 - 0.75 = 0.25, 0.85
+      expect(mirrored[3].dx, closeTo(0.25, 1e-4));
+      expect(mirrored[3].dy, closeTo(0.85, 1e-4));
+    });
+  });
+
+  group('10. EditorProvider Unified Document Lifecycle & Crop Reset', () {
+    test('addPage initializes default title when document title is empty', () {
+      final editor = EditorProvider();
+      expect(editor.documentTitle, isEmpty);
+
+      final page = const DocumentPage(
+        id: 'test_page',
+        pageNumber: 1,
+        corners: [
+          CornerPoint(0.1, 0.1),
+          CornerPoint(0.9, 0.1),
+          CornerPoint(0.9, 0.9),
+          CornerPoint(0.1, 0.9),
+        ],
+        filterType: 'auto',
+      );
+
+      editor.addPage(page);
+      expect(editor.documentTitle, isNotEmpty);
+      expect(editor.documentTitle, startsWith('Scan '));
+      expect(editor.cornerPoints[0].dx, closeTo(0.1, 1e-4));
+      expect(editor.pages.length, equals(1));
+    });
+
+    test('resetCrop resets to full frame when autoDetectedCorners is null', () {
+      final editor = EditorProvider();
+      final page = const DocumentPage(
+        id: 'manual_page',
+        pageNumber: 1,
+        corners: [
+          CornerPoint(0.2, 0.2),
+          CornerPoint(0.8, 0.2),
+          CornerPoint(0.8, 0.8),
+          CornerPoint(0.2, 0.8),
+        ],
+        autoDetectedCorners: null,
+        filterType: 'auto',
+      );
+
+      editor.initializeWithPages([page]);
+      expect(editor.cornerPoints[0].dx, closeTo(0.2, 1e-4));
+
+      editor.resetCrop();
+      expect(editor.cornerPoints[0].dx, equals(0.0));
+      expect(editor.cornerPoints[0].dy, equals(0.0));
+      expect(editor.cornerPoints[2].dx, equals(1.0));
+      expect(editor.cornerPoints[2].dy, equals(1.0));
+    });
+
+    test('resetToFullFrame unconditionally restores full image boundary', () {
+      final editor = EditorProvider();
+      final page = const DocumentPage(
+        id: 'detected_page',
+        pageNumber: 1,
+        corners: [
+          CornerPoint(0.15, 0.15),
+          CornerPoint(0.85, 0.15),
+          CornerPoint(0.85, 0.85),
+          CornerPoint(0.15, 0.85),
+        ],
+        autoDetectedCorners: [
+          CornerPoint(0.15, 0.15),
+          CornerPoint(0.85, 0.15),
+          CornerPoint(0.85, 0.85),
+          CornerPoint(0.15, 0.85),
+        ],
+        filterType: 'auto',
+      );
+
+      editor.initializeWithPages([page]);
+      expect(editor.cornerPoints[0].dx, closeTo(0.15, 1e-4));
+
+      editor.resetToFullFrame();
+      expect(editor.cornerPoints[0].dx, equals(0.0));
+      expect(editor.cornerPoints[0].dy, equals(0.0));
+      expect(editor.cornerPoints[2].dx, equals(1.0));
+      expect(editor.cornerPoints[2].dy, equals(1.0));
+    });
+  });
 }
 
 
