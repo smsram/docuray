@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:permission_handler/permission_handler.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_typography.dart';
 import '../../core/constants/app_dimensions.dart';
 import '../../core/widgets/app_card.dart';
 import '../../core/widgets/app_buttons.dart';
 
-/// Screen 18: Permissions Status Screen describing Camera, Storage, and Notification access.
+/// Screen 18: Real Permissions Status Screen inspecting Camera, Storage, and Notification access.
 class PermissionsScreen extends StatefulWidget {
   const PermissionsScreen({super.key});
 
@@ -14,10 +15,77 @@ class PermissionsScreen extends StatefulWidget {
   State<PermissionsScreen> createState() => _PermissionsScreenState();
 }
 
-class _PermissionsScreenState extends State<PermissionsScreen> {
-  bool _cameraAllowed = true;
-  bool _photosAllowed = true;
+class _PermissionsScreenState extends State<PermissionsScreen> with WidgetsBindingObserver {
+  bool _cameraAllowed = false;
+  bool _photosAllowed = false;
   bool _notificationsAllowed = false;
+  bool _checking = true;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _checkPermissions();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkPermissions();
+    }
+  }
+
+  Future<void> _checkPermissions() async {
+    setState(() => _checking = true);
+    try {
+      final camera = await Permission.camera.status;
+      final photos = await Permission.photos.status;
+      final storage = await Permission.storage.status;
+      final notifications = await Permission.notification.status;
+
+      setState(() {
+        _cameraAllowed = camera.isGranted || camera.isLimited;
+        _photosAllowed = photos.isGranted || photos.isLimited || storage.isGranted;
+        _notificationsAllowed = notifications.isGranted;
+        _checking = false;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _checking = false);
+    }
+  }
+
+  Future<void> _requestCamera() async {
+    final status = await Permission.camera.request();
+    if (status.isPermanentlyDenied) {
+      await openAppSettings();
+    }
+    await _checkPermissions();
+  }
+
+  Future<void> _requestPhotos() async {
+    final status = await Permission.photos.request();
+    if (status.isPermanentlyDenied) {
+      final storageStatus = await Permission.storage.request();
+      if (storageStatus.isPermanentlyDenied) {
+        await openAppSettings();
+      }
+    }
+    await _checkPermissions();
+  }
+
+  Future<void> _requestNotifications() async {
+    final status = await Permission.notification.request();
+    if (status.isPermanentlyDenied) {
+      await openAppSettings();
+    }
+    await _checkPermissions();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -33,69 +101,64 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
         title: const Text('App Permissions'),
       ),
       body: SafeArea(
-        child: SingleChildScrollView(
-          padding: AppDimensions.screenPadding,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'DocuRay requires specific device permissions to capture high-definition scans and store PDFs on your phone.',
-                style: AppTypography.body.copyWith(
-                  color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+        child: _checking
+            ? const Center(child: CircularProgressIndicator())
+            : SingleChildScrollView(
+                padding: AppDimensions.screenPadding,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'DocuRay requires specific device permissions to capture high-definition scans and store PDFs on your phone.',
+                      style: AppTypography.body.copyWith(
+                        color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    // 1. Camera Permission Card
+                    _buildPermissionCard(
+                      icon: Icons.camera_alt_outlined,
+                      title: 'Camera',
+                      reason: 'Required to scan physical papers, receipts, and book pages with real-time corner detection.',
+                      isAllowed: _cameraAllowed,
+                      onRequest: _requestCamera,
+                      isDark: isDark,
+                    ),
+                    const SizedBox(height: 16),
+
+                    // 2. Photos & Storage Card
+                    _buildPermissionCard(
+                      icon: Icons.photo_library_outlined,
+                      title: 'Photos & Storage',
+                      reason: 'Required to import existing images or PDF documents and save exported files to your device storage.',
+                      isAllowed: _photosAllowed,
+                      onRequest: _requestPhotos,
+                      isDark: isDark,
+                    ),
+                    const SizedBox(height: 16),
+
+                    // 3. Notifications Card
+                    _buildPermissionCard(
+                      icon: Icons.notifications_none_rounded,
+                      title: 'Notifications',
+                      reason: 'Optional notifications when background cloud sync to Google Drive completes or needs attention.',
+                      isAllowed: _notificationsAllowed,
+                      onRequest: _requestNotifications,
+                      isDark: isDark,
+                    ),
+                    const SizedBox(height: 28),
+
+                    // Open Android System Settings CTA
+                    SecondaryButton(
+                      label: 'Open Android App Settings',
+                      icon: Icons.settings_outlined,
+                      width: double.infinity,
+                      onPressed: openAppSettings,
+                    ),
+                  ],
                 ),
               ),
-              const SizedBox(height: 20),
-
-              // 1. Camera Permission Card
-              _buildPermissionCard(
-                icon: Icons.camera_alt_outlined,
-                title: 'Camera',
-                reason: 'Required to scan physical papers, receipts, and book pages with real-time corner detection.',
-                isAllowed: _cameraAllowed,
-                onToggle: () => setState(() => _cameraAllowed = !_cameraAllowed),
-                isDark: isDark,
-              ),
-              const SizedBox(height: 16),
-
-              // 2. Photos & Storage Card
-              _buildPermissionCard(
-                icon: Icons.photo_library_outlined,
-                title: 'Photos & Files',
-                reason: 'Required to import existing images or PDF documents and save exported files to your device storage.',
-                isAllowed: _photosAllowed,
-                onToggle: () => setState(() => _photosAllowed = !_photosAllowed),
-                isDark: isDark,
-              ),
-              const SizedBox(height: 16),
-
-              // 3. Notifications Card
-              _buildPermissionCard(
-                icon: Icons.notifications_none_rounded,
-                title: 'Notifications',
-                reason: 'Optional notifications when background cloud sync to Google Drive completes or needs attention.',
-                isAllowed: _notificationsAllowed,
-                onToggle: () => setState(() => _notificationsAllowed = !_notificationsAllowed),
-                isDark: isDark,
-              ),
-              const SizedBox(height: 28),
-
-              // Open Android System Settings CTA
-              SecondaryButton(
-                label: 'Open Android App Settings',
-                icon: Icons.settings_outlined,
-                width: double.infinity,
-                onPressed: () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Opens device system settings in production.'),
-                      behavior: SnackBarBehavior.floating,
-                    ),
-                  );
-                },
-              ),
-            ],
-          ),
-        ),
       ),
     );
   }
@@ -105,7 +168,7 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
     required String title,
     required String reason,
     required bool isAllowed,
-    required VoidCallback onToggle,
+    required VoidCallback onRequest,
     required bool isDark,
   }) {
     return AppCard(
@@ -163,11 +226,11 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
                 ),
               ),
               TextButton(
-                onPressed: onToggle,
+                onPressed: isAllowed ? openAppSettings : onRequest,
                 child: Text(
-                  isAllowed ? 'Revoke' : 'Allow',
+                  isAllowed ? 'Settings' : 'Allow',
                   style: TextStyle(
-                    color: isAllowed ? AppColors.error : (isDark ? AppColors.darkPrimary : AppColors.primary),
+                    color: isDark ? AppColors.darkPrimary : AppColors.primary,
                   ),
                 ),
               ),

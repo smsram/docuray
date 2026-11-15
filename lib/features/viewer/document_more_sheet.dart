@@ -4,6 +4,7 @@ import '../../core/constants/app_dimensions.dart';
 import '../../core/widgets/bottom_action_sheet.dart';
 import '../../core/widgets/confirm_dialog.dart';
 import '../../core/providers/documents_provider.dart';
+import '../../core/services/native_scanner_service.dart';
 import '../../models/models.dart';
 import '../share/share_export_sheet.dart';
 
@@ -57,7 +58,37 @@ class DocumentMoreSheet {
           title: 'Share & Export',
           icon: Icons.share_outlined,
           onTap: () {
-            ShareExportSheet.show(context, documentTitle: document.title);
+            ShareExportSheet.show(context, documentTitle: document.title, document: document);
+          },
+        ),
+        // 5b. Save to Device (SAF)
+        ActionSheetItem(
+          title: 'Save to Device (Storage)',
+          icon: Icons.download_rounded,
+          onTap: () async {
+            if (document.pdfPath != null) {
+              final safeTitle = document.title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+              try {
+                final uri = await NativeScannerService.savePdfToDevice(
+                  sourcePath: document.pdfPath!,
+                  suggestedName: '$safeTitle.pdf',
+                );
+                if (uri != null && context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Saved "$safeTitle.pdf" to Device via Android SAF.'),
+                      backgroundColor: AppColors.success,
+                    ),
+                  );
+                }
+              } catch (e) {
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Save error: $e'), backgroundColor: AppColors.error),
+                  );
+                }
+              }
+            }
           },
         ),
         // 6. Back up to Google Drive

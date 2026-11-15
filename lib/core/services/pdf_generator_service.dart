@@ -51,12 +51,15 @@ enum PdfExportQuality {
 /// with configurable export quality and natural document aspect preservation.
 class PdfGeneratorService {
   /// Generates a real multi-page PDF file from [pages] at [outputPath].
+  /// When [isPreCompressed] is true, avoids redundant decoding/encoding in Dart and
+  /// embeds raw JPEG bytes directly into the PDF in milliseconds.
   static Future<File> generatePdf({
     required List<DocumentPage> pages,
     required String outputPath,
     String? documentTitle,
     PdfExportQuality quality = PdfExportQuality.standard,
     PdfPageFormat? pageFormat,
+    bool isPreCompressed = false,
   }) async {
     final pdf = pw.Document(
       title: documentTitle ?? 'DocuRay Scanned Document',
@@ -72,65 +75,162 @@ class PdfGeneratorService {
       if (!await file.exists()) continue;
 
       final rawBytes = await file.readAsBytes();
-      final decoded = img.decodeImage(rawBytes);
-      if (decoded == null) continue;
+      final pw.MemoryImage image;
+      final double aspect;
 
-      // Downscale to target DPI if necessary, NEVER upscale low-res images
-      var pageImg = decoded;
-      final maxDim = quality.maxDimension;
-      if (pageImg.width > maxDim || pageImg.height > maxDim) {
-        final isWLonger = pageImg.width >= pageImg.height;
-        pageImg = img.copyResize(
-          pageImg,
-          width: isWLonger ? maxDim : null,
-          height: !isWLonger ? maxDim : null,
-          interpolation: img.Interpolation.linear,
-        );
-      }
-
-      // Encode image bytes according to preset and filter type
-      List<int> encodedBytes;
-      if (page.filterType.toLowerCase() == 'bw') {
-        // High compression for binary text
-        encodedBytes = img.encodeJpg(pageImg, quality: 85);
+      if (isPreCompressed) {
+        // Fast, zero-heap-overhead direct embedding:
+        // Already pre-scaled and encoded with target quality by the export pipeline
+        image = pw.MemoryImage(rawBytes);
+        final decoder = img.findDecoderForData(rawBytes);
+        final info = decoder?.startDecode(rawBytes);
+        if (info != null && info.height > 0) {
+          aspect = info.width / info.height;
+        } else if (page.imageWidth != null && page.imageHeight != null && page.imageHeight! > 0) {
+          aspect = page.imageWidth! / page.imageHeight!;
+        } else {
+          aspect = 3.0 / 4.0;
+        }
       } else {
-        encodedBytes = img.encodeJpg(pageImg, quality: quality.jpegQuality);
+        // Fallback for direct non-precompressed generation (e.g. unit tests):
+        final decoded = img.decodeImage(rawBytes);
+        if (decoded == null) continue;
+
+        var pageImg = decoded;
+        final maxDim = quality.maxDimension;
+        if (pageImg.width > maxDim || pageImg.height > maxDim) {
+          final isWLonger = pageImg.width >= pageImg.height;
+          pageImg = img.copyResize(
+            pageImg,
+            width: isWLonger ? maxDim : null,
+            height: !isWLonger ? maxDim : null,
+            interpolation: img.Interpolation.linear,
+          );
+        }
+
+        final List<int> encodedBytes;
+        if (page.filterType.toLowerCase() == 'bw') {
+          // High compression for binary text
+          encodedBytes = img.encodeJpg(pageImg, quality: 85);
+        } else {
+          encodedBytes = img.encodeJpg(pageImg, quality: quality.jpegQuality);
+        }
+
+        image = pw.MemoryImage(Uint8List.fromList(encodedBytes));
+        aspect = pageImg.width / pageImg.height;
       }
 
-      final image = pw.MemoryImage(Uint8List.fromList(encodedBytes));
-
-      // Calculate natural document aspect ratio
-      final double aspect = pageImg.width / pageImg.height;
+      // Determine PDF page format based on page.resize config or fallback aspect
       final PdfPageFormat effectiveFormat;
-
       if (pageFormat != null) {
         effectiveFormat = pageFormat;
-      } else if ((aspect - (210.0 / 297.0)).abs() < 0.12) {
-        // Close to standard portrait A4
-        effectiveFormat = PdfPageFormat.a4;
-      } else if ((aspect - (297.0 / 210.0)).abs() < 0.12) {
-        // Close to standard landscape A4
-        effectiveFormat = PdfPageFormat.a4.landscape;
       } else {
-        // Natural document proportions (receipts, ID cards, business cards)
-        const double baseWidth = 595.28; // Standard A4 width in points
-        final double baseHeight = (baseWidth / aspect).clamp(200.0, 1600.0);
-        effectiveFormat = PdfPageFormat(baseWidth, baseHeight);
+        switch (page.resize.preset.toLowerCase()) {
+          case 'a4':
+            effectiveFormat = (aspect > 1.0) ? PdfPageFormat.a4.landscape : PdfPageFormat.a4;
+            break;
+          case 'a5':
+            effectiveFormat = (aspect > 1.0) ? PdfPageFormat.a5.landscape : PdfPageFormat.a5;
+            break;
+          case 'letter':
+            effectiveFormat = (aspect > 1.0) ? PdfPageFormat.letter.landscape : PdfPageFormat.letter;
+            break;
+          case 'legal':
+            effectiveFormat = (aspect > 1.0) ? PdfPageFormat.legal.landscape : PdfPageFormat.legal;
+            break;
+          case 'custom':
+            final w = page.resize.customWidth ?? 595.28;
+            final h = page.resize.customHeight ?? 841.89;
+            effectiveFormat = PdfPageFormat(w, h);
+            break;
+          case 'original':
+          default:
+            if ((aspect - (210.0 / 297.0)).abs() < 0.12) {
+              effectiveFormat = PdfPageFormat.a4;
+            } else if ((aspect - (297.0 / 210.0)).abs() < 0.12) {
+              effectiveFormat = PdfPageFormat.a4.landscape;
+            } else {
+              const double baseWidth = 595.28;
+              final double baseHeight = (baseWidth / aspect).clamp(200.0, 1600.0);
+              effectiveFormat = PdfPageFormat(baseWidth, baseHeight);
+            }
+            break;
+        }
       }
 
+      // Build page content with optional margins, borders, and watermark
       pdf.addPage(
         pw.Page(
           pageFormat: effectiveFormat,
           margin: pw.EdgeInsets.zero,
           build: (pw.Context context) {
+            pw.Widget content = pw.Center(
+              child: pw.Image(
+                image,
+                fit: pw.BoxFit.contain,
+              ),
+            );
+
+            // Apply page border if enabled
+            if (page.border.enabled) {
+              final borderColor = PdfColor.fromInt(page.border.colorValue);
+              final thickness = page.border.thickness.clamp(0.5, 12.0);
+              content = pw.Container(
+                decoration: pw.BoxDecoration(
+                  border: pw.Border.all(
+                    color: borderColor,
+                    width: thickness,
+                  ),
+                ),
+                child: content,
+              );
+            }
+
+            // Apply page margins if set
+            if (page.margins.hasMargins) {
+              content = pw.Padding(
+                padding: pw.EdgeInsets.fromLTRB(
+                  page.margins.left,
+                  page.margins.top,
+                  page.margins.right,
+                  page.margins.bottom,
+                ),
+                child: content,
+              );
+            }
+
+            // Apply watermark overlay if enabled
+            if (page.watermark.enabled) {
+              final wm = page.watermark;
+              final baseColor = PdfColor.fromInt(wm.colorValue);
+              final wmColor = PdfColor(baseColor.red, baseColor.green, baseColor.blue, wm.opacity);
+
+              final watermarkWidget = pw.Center(
+                child: pw.Transform.rotate(
+                  angle: wm.rotation * (3.141592653589793 / 180.0),
+                  child: pw.Text(
+                    wm.text,
+                    style: pw.TextStyle(
+                      color: wmColor,
+                      fontSize: wm.fontSize,
+                      fontWeight: pw.FontWeight.bold,
+                    ),
+                  ),
+                ),
+              );
+
+              content = pw.Stack(
+                fit: pw.StackFit.expand,
+                children: [
+                  content,
+                  watermarkWidget,
+                ],
+              );
+            }
+
             return pw.FullPage(
               ignoreMargins: true,
-              child: pw.Center(
-                child: pw.Image(
-                  image,
-                  fit: pw.BoxFit.contain,
-                ),
-              ),
+              child: content,
             );
           },
         ),

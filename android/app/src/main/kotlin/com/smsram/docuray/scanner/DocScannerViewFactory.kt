@@ -1,4 +1,4 @@
-package com.docuray.docuray.scanner
+package com.smsram.docuray.scanner
 
 import android.app.Activity
 import android.content.Context

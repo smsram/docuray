@@ -70,7 +70,8 @@ class ScannerProvider extends ChangeNotifier {
   QualityIssue _qualityIssue = QualityIssue.moveCloser;
 
   String _flashMode = 'off';
-  String _captureMode = 'Auto';
+  bool _isAutoCapture = true;
+  bool _isAutoCrop = true;
   String _captureType = 'Document';
 
   // Prediction Lifecycle State Management
@@ -79,6 +80,7 @@ class ScannerProvider extends ChangeNotifier {
   bool _hasEverReceivedValidPrediction = false;
   DateTime? _lastValidPredictionTime;
 
+  bool _shouldCancelInit = false;
   bool _isProcessingFrame = false;
   bool _isDetecting = false;
   bool _isCapturing = false;
@@ -108,8 +110,9 @@ class ScannerProvider extends ChangeNotifier {
   QualityIssue get qualityIssue => _qualityIssue;
   String get flashMode => _flashMode;
   bool get isFlashOn => _flashMode == 'on';
-  String get captureMode => _captureMode;
-  bool get isAutoCapture => _captureMode == 'Auto';
+  String get captureMode => _isAutoCapture ? 'Auto' : 'Manual';
+  bool get isAutoCapture => _isAutoCapture;
+  bool get isAutoCrop => _isAutoCrop;
   String get captureType => _captureType;
   String get scanMode => _captureType;
   DocumentPredictionState get predictionState => _predictionState;
@@ -282,6 +285,8 @@ class ScannerProvider extends ChangeNotifier {
   Future<void> initializeCamera() async {
     if (_isInitializing || _isCameraReady) return;
     _isInitializing = true;
+    _shouldCancelInit = false;
+    _isCameraActive = true;
     notifyListeners();
 
     try {
@@ -319,16 +324,41 @@ class ScannerProvider extends ChangeNotifier {
         orElse: () => _availableCameras.first,
       );
 
-      final controller = CameraController(
-        rearCamera,
-        ResolutionPreset.medium,
-        enableAudio: false,
-        imageFormatGroup: Platform.isAndroid
-            ? ImageFormatGroup.yuv420
-            : ImageFormatGroup.bgra8888,
-      );
+      CameraController controller;
+      try {
+        controller = CameraController(
+          rearCamera,
+          ResolutionPreset.veryHigh, // Crisp, high-definition 1080p preview & capture
+          enableAudio: false,
+          imageFormatGroup: Platform.isAndroid
+              ? ImageFormatGroup.yuv420
+              : ImageFormatGroup.bgra8888,
+        );
+        await controller.initialize();
+      } catch (e) {
+        debugPrint('[DocuRay] veryHigh preset failed, falling back to high (720p): $e');
+        controller = CameraController(
+          rearCamera,
+          ResolutionPreset.high,
+          enableAudio: false,
+          imageFormatGroup: Platform.isAndroid
+              ? ImageFormatGroup.yuv420
+              : ImageFormatGroup.bgra8888,
+        );
+        await controller.initialize();
+      }
 
-      await controller.initialize();
+      // Check whether user left the scanner screen or paused while awaiting initialization
+      if (_shouldCancelInit || !_isCameraActive) {
+        try {
+          await controller.dispose();
+        } catch (_) {}
+        _isCameraReady = false;
+        _isInitializing = false;
+        notifyListeners();
+        return;
+      }
+
       _cameraController = controller;
       _isCameraReady = true;
       _isInitializing = false;
@@ -385,7 +415,7 @@ class ScannerProvider extends ChangeNotifier {
   }
 
   void _scheduleNextInference() {
-    if (_isDisposed || _isProcessingFrame || _pendingFrame == null || !isAutoCapture || _isCapturing || !_isCameraActive) {
+    if (_isDisposed || _isProcessingFrame || _pendingFrame == null || (!_isAutoCapture && !_isAutoCrop) || _isCapturing || !_isCameraActive) {
       return;
     }
 
@@ -401,7 +431,7 @@ class ScannerProvider extends ChangeNotifier {
       _isDetecting = false;
 
       // Immediately process the freshest available frame that arrived during inference
-      if (!_isDisposed && _pendingFrame != null && isAutoCapture && !_isCapturing && _isCameraActive) {
+      if (!_isDisposed && _pendingFrame != null && (_isAutoCapture || _isAutoCrop) && !_isCapturing && _isCameraActive) {
         _scheduleNextInference();
       }
     });
@@ -415,7 +445,7 @@ class ScannerProvider extends ChangeNotifier {
         sensorOrientation: sensorOrientation,
       );
 
-      if (_isDisposed || !_isCameraActive || !isAutoCapture) return;
+      if (_isDisposed || !_isCameraActive || (!_isAutoCapture && !_isAutoCrop)) return;
 
       _diagnostics.recordCompletedPrediction(result.metrics);
       if (result.metrics != null) {
@@ -439,13 +469,13 @@ class ScannerProvider extends ChangeNotifier {
 
         final stableFrames = _cornerDetector.consecutiveStableFrames;
 
-        if (stableFrames >= 6) {
+        if (stableFrames >= 4) {
           _state = ScannerState.ready;
           _readyStartTime ??= DateTime.now();
 
-          if (isAutoCapture &&
+          if (_isAutoCapture &&
               !_isCapturing &&
-              DateTime.now().difference(_readyStartTime!).inMilliseconds >= 500) {
+              DateTime.now().difference(_readyStartTime!).inMilliseconds >= 250) {
             _triggerAutoCapture();
           }
         } else if (stableFrames >= 2) {
@@ -629,7 +659,7 @@ class ScannerProvider extends ChangeNotifier {
       final bool isFront = _cameraController!.description.lensDirection == CameraLensDirection.front;
 
       List<CornerPoint> finalCorners;
-      if (hadDetection && capturedCorners != null && capturedCorners.length == 4) {
+      if (_isAutoCrop && hadDetection && capturedCorners != null && capturedCorners.length == 4) {
         var cornersToMap = capturedCorners;
 
         // Front camera mirroring: flip horizontally and preserve [TL, TR, BR, BL] order
@@ -674,7 +704,7 @@ class ScannerProvider extends ChangeNotifier {
         pageNumber: 1,
         originalImagePath: xFile.path,
         corners: finalCorners,
-        autoDetectedCorners: hadDetection ? finalCorners : null,
+        autoDetectedCorners: (_isAutoCrop && hadDetection) ? finalCorners : null,
         imageWidth: photoW,
         imageHeight: photoH,
         filterType: 'auto',
@@ -703,8 +733,8 @@ class ScannerProvider extends ChangeNotifier {
     _state = ScannerState.processing;
     notifyListeners();
 
-    // Snapshot current capture mode before picker opens
-    final bool shouldRunDetection = isAutoCapture;
+    // Run AI detection if Auto Crop is enabled
+    final bool shouldRunDetection = _isAutoCrop;
 
     try {
       final picker = ImagePicker();
@@ -824,6 +854,7 @@ class ScannerProvider extends ChangeNotifier {
   }
 
   Future<void> pauseCamera() async {
+    _shouldCancelInit = true;
     _isCameraActive = false;
     _pendingFrame = null;
     _isProcessingFrame = false;
@@ -903,13 +934,12 @@ class ScannerProvider extends ChangeNotifier {
 
   void toggleFlash() => cycleFlash();
 
-  void setCaptureMode(String mode) {
-    if (_captureMode == mode) return;
-    _captureMode = mode;
+  void setAutoCapture(bool val) {
+    if (_isAutoCapture == val) return;
+    _isAutoCapture = val;
     _readyStartTime = null;
 
-    if (!isAutoCapture) {
-      // Manual mode: cancel queued frames, clear indicators, pause model inference
+    if (!_isAutoCapture && !_isAutoCrop) {
       _pendingFrame = null;
       _hasValidPrediction = false;
       _detectedCorners = null;
@@ -918,31 +948,37 @@ class ScannerProvider extends ChangeNotifier {
       predictionStateNotifier.value = DocumentPredictionState.stopped;
       _state = ScannerState.searching;
       _cornerDetector.resetStabilization();
-      if (useNativePlatformView && _nativeChannel != null) {
-        try {
-          _nativeChannel!.invokeMethod('setAutoMode', {'isAuto': false});
-        } catch (_) {}
-      }
-    } else {
-      // Auto mode: start fresh with clean detection state
-      _hasValidPrediction = false;
-      _detectedCorners = null;
-      cornersNotifier.value = null;
-      _predictionState = DocumentPredictionState.initialNoPrediction;
-      predictionStateNotifier.value = DocumentPredictionState.initialNoPrediction;
-      _state = ScannerState.searching;
-      _cornerDetector.resetStabilization();
-      if (useNativePlatformView && _nativeChannel != null) {
-        try {
-          _nativeChannel!.invokeMethod('setAutoMode', {'isAuto': true});
-        } catch (_) {}
-      }
     }
     notifyListeners();
   }
 
+  void setAutoCrop(bool val) {
+    if (_isAutoCrop == val) return;
+    _isAutoCrop = val;
+
+    if (!_isAutoCapture && !_isAutoCrop) {
+      _pendingFrame = null;
+      _hasValidPrediction = false;
+      _detectedCorners = null;
+      cornersNotifier.value = null;
+      _predictionState = DocumentPredictionState.stopped;
+      predictionStateNotifier.value = DocumentPredictionState.stopped;
+      _state = ScannerState.searching;
+      _cornerDetector.resetStabilization();
+    }
+    notifyListeners();
+  }
+
+  void setCaptureMode(String mode) {
+    setAutoCapture(mode == 'Auto');
+  }
+
   void toggleAutoCapture() {
-    setCaptureMode(isAutoCapture ? 'Manual' : 'Auto');
+    setAutoCapture(!_isAutoCapture);
+  }
+
+  void toggleAutoCrop() {
+    setAutoCrop(!_isAutoCrop);
   }
 
   void setCaptureType(String type) {

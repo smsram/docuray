@@ -23,6 +23,384 @@ class CornerPoint {
   }
 }
 
+/// A freehand erasing stroke applied to a document page.
+class EraseStroke {
+  final List<Offset> points;
+  final double strokeWidth;
+
+  const EraseStroke({required this.points, this.strokeWidth = 20.0});
+
+  Map<String, dynamic> toJson() => {
+    'points': points.map((p) => {'x': p.dx, 'y': p.dy}).toList(),
+    'strokeWidth': strokeWidth,
+  };
+
+  factory EraseStroke.fromJson(Map<String, dynamic> json) {
+    return EraseStroke(
+      points: (json['points'] as List<dynamic>?)
+              ?.map((p) => Offset((p['x'] as num).toDouble(), (p['y'] as num).toDouble()))
+              .toList() ?? [],
+      strokeWidth: (json['strokeWidth'] as num?)?.toDouble() ?? 20.0,
+    );
+  }
+}
+
+/// Type of annotation drawn on a page.
+enum AnnotationType {
+  pen,
+  highlighter,
+  text,
+  rectangle,
+  circle,
+  line,
+  arrow,
+  signature,
+}
+
+/// An individual vector or text annotation placed on a page.
+class AnnotationElement {
+  final String id;
+  final AnnotationType type;
+  final List<Offset> points; // Normalized 0.0 - 1.0 points
+  final String? text;
+  final int colorValue;
+  final double strokeWidth;
+  final double fontSize;
+
+  const AnnotationElement({
+    required this.id,
+    required this.type,
+    required this.points,
+    this.text,
+    this.colorValue = 0xFFFF0000,
+    this.strokeWidth = 3.0,
+    this.fontSize = 18.0,
+  });
+
+  Color get color => Color(colorValue);
+
+  AnnotationElement copyWith({
+    String? id,
+    AnnotationType? type,
+    List<Offset>? points,
+    String? text,
+    int? colorValue,
+    double? strokeWidth,
+    double? fontSize,
+  }) {
+    return AnnotationElement(
+      id: id ?? this.id,
+      type: type ?? this.type,
+      points: points ?? this.points,
+      text: text ?? this.text,
+      colorValue: colorValue ?? this.colorValue,
+      strokeWidth: strokeWidth ?? this.strokeWidth,
+      fontSize: fontSize ?? this.fontSize,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'type': type.name,
+    'points': points.map((p) => {'x': p.dx, 'y': p.dy}).toList(),
+    if (text != null) 'text': text,
+    'colorValue': colorValue,
+    'strokeWidth': strokeWidth,
+    'fontSize': fontSize,
+  };
+
+  factory AnnotationElement.fromJson(Map<String, dynamic> json) {
+    return AnnotationElement(
+      id: json['id'] as String? ?? 'ann_${DateTime.now().microsecondsSinceEpoch}',
+      type: AnnotationType.values.firstWhere(
+        (t) => t.name == json['type'],
+        orElse: () => AnnotationType.pen,
+      ),
+      points: (json['points'] as List<dynamic>?)
+              ?.map((p) => Offset((p['x'] as num).toDouble(), (p['y'] as num).toDouble()))
+              .toList() ?? [],
+      text: json['text'] as String?,
+      colorValue: json['colorValue'] as int? ?? 0xFFFF0000,
+      strokeWidth: (json['strokeWidth'] as num?)?.toDouble() ?? 3.0,
+      fontSize: (json['fontSize'] as num?)?.toDouble() ?? 18.0,
+    );
+  }
+}
+
+/// Configuration for text or image watermark.
+class WatermarkConfig {
+  final bool enabled;
+  final String type; // 'text' or 'image'
+  final String text;
+  final double fontSize;
+  final int colorValue;
+  final double opacity;
+  final double rotation; // In degrees
+  final String position; // 'diagonal', 'center', 'top', 'bottom'
+  final String? imagePath;
+  final double imageScale;
+
+  const WatermarkConfig({
+    this.enabled = false,
+    this.type = 'text',
+    this.text = 'CONFIDENTIAL',
+    this.fontSize = 32.0,
+    this.colorValue = 0x6694A3B8,
+    this.opacity = 0.35,
+    this.rotation = -35.0,
+    this.position = 'diagonal',
+    this.imagePath,
+    this.imageScale = 0.5,
+  });
+
+  Color get color => Color(colorValue);
+
+  WatermarkConfig copyWith({
+    bool? enabled,
+    String? type,
+    String? text,
+    double? fontSize,
+    int? colorValue,
+    double? opacity,
+    double? rotation,
+    String? position,
+    String? imagePath,
+    double? imageScale,
+  }) {
+    return WatermarkConfig(
+      enabled: enabled ?? this.enabled,
+      type: type ?? this.type,
+      text: text ?? this.text,
+      fontSize: fontSize ?? this.fontSize,
+      colorValue: colorValue ?? this.colorValue,
+      opacity: opacity ?? this.opacity,
+      rotation: rotation ?? this.rotation,
+      position: position ?? this.position,
+      imagePath: imagePath ?? this.imagePath,
+      imageScale: imageScale ?? this.imageScale,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'enabled': enabled,
+    'type': type,
+    'text': text,
+    'fontSize': fontSize,
+    'colorValue': colorValue,
+    'opacity': opacity,
+    'rotation': rotation,
+    'position': position,
+    if (imagePath != null) 'imagePath': imagePath,
+    'imageScale': imageScale,
+  };
+
+  factory WatermarkConfig.fromJson(Map<String, dynamic> json) {
+    return WatermarkConfig(
+      enabled: json['enabled'] as bool? ?? false,
+      type: json['type'] as String? ?? 'text',
+      text: json['text'] as String? ?? 'CONFIDENTIAL',
+      fontSize: (json['fontSize'] as num?)?.toDouble() ?? 32.0,
+      colorValue: json['colorValue'] as int? ?? 0x6694A3B8,
+      opacity: (json['opacity'] as num?)?.toDouble() ?? 0.35,
+      rotation: (json['rotation'] as num?)?.toDouble() ?? -35.0,
+      position: json['position'] as String? ?? 'diagonal',
+      imagePath: json['imagePath'] as String?,
+      imageScale: (json['imageScale'] as num?)?.toDouble() ?? 0.5,
+    );
+  }
+}
+
+/// A rectangular region on a page that is permanently redacted.
+class RedactionRect {
+  final String id;
+  final double left; // Normalized 0.0 - 1.0
+  final double top;
+  final double width;
+  final double height;
+
+  const RedactionRect({
+    required this.id,
+    required this.left,
+    required this.top,
+    required this.width,
+    required this.height,
+  });
+
+  Rect toRect(Size size) => Rect.fromLTWH(
+    left * size.width,
+    top * size.height,
+    width * size.width,
+    height * size.height,
+  );
+
+  RedactionRect copyWith({
+    String? id,
+    double? left,
+    double? top,
+    double? width,
+    double? height,
+  }) {
+    return RedactionRect(
+      id: id ?? this.id,
+      left: left ?? this.left,
+      top: top ?? this.top,
+      width: width ?? this.width,
+      height: height ?? this.height,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'left': left,
+    'top': top,
+    'width': width,
+    'height': height,
+  };
+
+  factory RedactionRect.fromJson(Map<String, dynamic> json) {
+    return RedactionRect(
+      id: json['id'] as String? ?? 'redact_${DateTime.now().microsecondsSinceEpoch}',
+      left: (json['left'] as num).toDouble(),
+      top: (json['top'] as num).toDouble(),
+      width: (json['width'] as num).toDouble(),
+      height: (json['height'] as num).toDouble(),
+    );
+  }
+}
+
+/// Page resizing and target paper dimension preset.
+class PageResizeConfig {
+  final String preset; // 'original', 'a4', 'a5', 'letter', 'legal', 'custom'
+  final double? customWidth;
+  final double? customHeight;
+
+  const PageResizeConfig({
+    this.preset = 'original',
+    this.customWidth,
+    this.customHeight,
+  });
+
+  PageResizeConfig copyWith({
+    String? preset,
+    double? customWidth,
+    double? customHeight,
+  }) {
+    return PageResizeConfig(
+      preset: preset ?? this.preset,
+      customWidth: customWidth ?? this.customWidth,
+      customHeight: customHeight ?? this.customHeight,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'preset': preset,
+    if (customWidth != null) 'customWidth': customWidth,
+    if (customHeight != null) 'customHeight': customHeight,
+  };
+
+  factory PageResizeConfig.fromJson(Map<String, dynamic> json) {
+    return PageResizeConfig(
+      preset: json['preset'] as String? ?? 'original',
+      customWidth: (json['customWidth'] as num?)?.toDouble(),
+      customHeight: (json['customHeight'] as num?)?.toDouble(),
+    );
+  }
+}
+
+/// Margin insets (in points) around page content.
+class PageMargins {
+  final double top;
+  final double bottom;
+  final double left;
+  final double right;
+
+  const PageMargins({
+    this.top = 0.0,
+    this.bottom = 0.0,
+    this.left = 0.0,
+    this.right = 0.0,
+  });
+
+  bool get hasMargins => top > 0 || bottom > 0 || left > 0 || right > 0;
+
+  PageMargins copyWith({
+    double? top,
+    double? bottom,
+    double? left,
+    double? right,
+  }) {
+    return PageMargins(
+      top: top ?? this.top,
+      bottom: bottom ?? this.bottom,
+      left: left ?? this.left,
+      right: right ?? this.right,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'top': top,
+    'bottom': bottom,
+    'left': left,
+    'right': right,
+  };
+
+  factory PageMargins.fromJson(Map<String, dynamic> json) {
+    return PageMargins(
+      top: (json['top'] as num?)?.toDouble() ?? 0.0,
+      bottom: (json['bottom'] as num?)?.toDouble() ?? 0.0,
+      left: (json['left'] as num?)?.toDouble() ?? 0.0,
+      right: (json['right'] as num?)?.toDouble() ?? 0.0,
+    );
+  }
+}
+
+/// Border applied around a scanned document page.
+class PageBorder {
+  final bool enabled;
+  final double thickness;
+  final int colorValue;
+  final String style; // 'solid', 'dashed', 'double'
+
+  const PageBorder({
+    this.enabled = false,
+    this.thickness = 2.0,
+    this.colorValue = 0xFF000000,
+    this.style = 'solid',
+  });
+
+  Color get color => Color(colorValue);
+
+  PageBorder copyWith({
+    bool? enabled,
+    double? thickness,
+    int? colorValue,
+    String? style,
+  }) {
+    return PageBorder(
+      enabled: enabled ?? this.enabled,
+      thickness: thickness ?? this.thickness,
+      colorValue: colorValue ?? this.colorValue,
+      style: style ?? this.style,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'enabled': enabled,
+    'thickness': thickness,
+    'colorValue': colorValue,
+    'style': style,
+  };
+
+  factory PageBorder.fromJson(Map<String, dynamic> json) {
+    return PageBorder(
+      enabled: json['enabled'] as bool? ?? false,
+      thickness: (json['thickness'] as num?)?.toDouble() ?? 2.0,
+      colorValue: json['colorValue'] as int? ?? 0xFF000000,
+      style: json['style'] as String? ?? 'solid',
+    );
+  }
+}
+
 /// Represents individual page within a scanned document.
 class DocumentPage {
   final String id;
@@ -31,14 +409,27 @@ class DocumentPage {
   final String? processedImagePath;
   final String? thumbnailPath;
   final int rotationDegrees;
-  final String filterType; // 'original', 'auto', 'color', 'grayscale', 'bw'
+  final String filterType; // 'original', 'auto', 'light_text', 'grayscale', 'whiteboard', 'bw'
   final double brightness; // -1.0 to 1.0
   final double contrast;   // -1.0 to 1.0
   final double sharpness;  // 0.0 to 1.0
+  final double highlights; // -1.0 to 1.0
+  final double shadows;    // -1.0 to 1.0
+  final double exposure;   // -1.0 to 1.0
+  final double saturation; // -1.0 to 1.0
   final List<CornerPoint> corners;
   final List<CornerPoint>? autoDetectedCorners;
   final int? imageWidth;
   final int? imageHeight;
+
+  // 16 Tools Persistent State
+  final List<EraseStroke> eraseStrokes;
+  final List<AnnotationElement> annotations;
+  final WatermarkConfig watermark;
+  final List<RedactionRect> redactions;
+  final PageResizeConfig resize;
+  final PageMargins margins;
+  final PageBorder border;
 
   const DocumentPage({
     required this.id,
@@ -51,6 +442,10 @@ class DocumentPage {
     this.brightness = 0.0,
     this.contrast = 0.0,
     this.sharpness = 0.0,
+    this.highlights = 0.0,
+    this.shadows = 0.0,
+    this.exposure = 0.0,
+    this.saturation = 0.0,
     this.corners = const [
       CornerPoint(0.05, 0.05),
       CornerPoint(0.95, 0.05),
@@ -60,6 +455,13 @@ class DocumentPage {
     this.autoDetectedCorners,
     this.imageWidth,
     this.imageHeight,
+    this.eraseStrokes = const [],
+    this.annotations = const [],
+    this.watermark = const WatermarkConfig(),
+    this.redactions = const [],
+    this.resize = const PageResizeConfig(),
+    this.margins = const PageMargins(),
+    this.border = const PageBorder(),
   });
 
   /// Upright aspect ratio (width / height) based on actual oriented image dimensions
@@ -82,10 +484,21 @@ class DocumentPage {
     double? brightness,
     double? contrast,
     double? sharpness,
+    double? highlights,
+    double? shadows,
+    double? exposure,
+    double? saturation,
     List<CornerPoint>? corners,
     List<CornerPoint>? autoDetectedCorners,
     int? imageWidth,
     int? imageHeight,
+    List<EraseStroke>? eraseStrokes,
+    List<AnnotationElement>? annotations,
+    WatermarkConfig? watermark,
+    List<RedactionRect>? redactions,
+    PageResizeConfig? resize,
+    PageMargins? margins,
+    PageBorder? border,
   }) {
     return DocumentPage(
       id: id ?? this.id,
@@ -98,10 +511,21 @@ class DocumentPage {
       brightness: brightness ?? this.brightness,
       contrast: contrast ?? this.contrast,
       sharpness: sharpness ?? this.sharpness,
+      highlights: highlights ?? this.highlights,
+      shadows: shadows ?? this.shadows,
+      exposure: exposure ?? this.exposure,
+      saturation: saturation ?? this.saturation,
       corners: corners ?? this.corners,
       autoDetectedCorners: autoDetectedCorners ?? this.autoDetectedCorners,
       imageWidth: imageWidth ?? this.imageWidth,
       imageHeight: imageHeight ?? this.imageHeight,
+      eraseStrokes: eraseStrokes ?? this.eraseStrokes,
+      annotations: annotations ?? this.annotations,
+      watermark: watermark ?? this.watermark,
+      redactions: redactions ?? this.redactions,
+      resize: resize ?? this.resize,
+      margins: margins ?? this.margins,
+      border: border ?? this.border,
     );
   }
 
@@ -116,11 +540,29 @@ class DocumentPage {
     'brightness': brightness,
     'contrast': contrast,
     'sharpness': sharpness,
+    'highlights': highlights,
+    'shadows': shadows,
+    'exposure': exposure,
+    'saturation': saturation,
     'corners': corners.map((c) => c.toJson()).toList(),
     if (autoDetectedCorners != null)
       'autoDetectedCorners': autoDetectedCorners!.map((c) => c.toJson()).toList(),
     if (imageWidth != null) 'imageWidth': imageWidth,
     if (imageHeight != null) 'imageHeight': imageHeight,
+    if (eraseStrokes.isNotEmpty)
+      'eraseStrokes': eraseStrokes.map((s) => s.toJson()).toList(),
+    if (annotations.isNotEmpty)
+      'annotations': annotations.map((a) => a.toJson()).toList(),
+    if (watermark.enabled)
+      'watermark': watermark.toJson(),
+    if (redactions.isNotEmpty)
+      'redactions': redactions.map((r) => r.toJson()).toList(),
+    if (resize.preset != 'original')
+      'resize': resize.toJson(),
+    if (margins.hasMargins)
+      'margins': margins.toJson(),
+    if (border.enabled)
+      'border': border.toJson(),
   };
 
   factory DocumentPage.fromJson(Map<String, dynamic> json) {
@@ -135,6 +577,10 @@ class DocumentPage {
       brightness: (json['brightness'] as num?)?.toDouble() ?? 0.0,
       contrast: (json['contrast'] as num?)?.toDouble() ?? 0.0,
       sharpness: (json['sharpness'] as num?)?.toDouble() ?? 0.0,
+      highlights: (json['highlights'] as num?)?.toDouble() ?? 0.0,
+      shadows: (json['shadows'] as num?)?.toDouble() ?? 0.0,
+      exposure: (json['exposure'] as num?)?.toDouble() ?? 0.0,
+      saturation: (json['saturation'] as num?)?.toDouble() ?? 0.0,
       corners: (json['corners'] as List<dynamic>?)
               ?.map((c) => CornerPoint.fromJson(c as Map<String, dynamic>))
               .toList() ??
@@ -149,6 +595,30 @@ class DocumentPage {
           .toList(),
       imageWidth: json['imageWidth'] as int?,
       imageHeight: json['imageHeight'] as int?,
+      eraseStrokes: (json['eraseStrokes'] as List<dynamic>?)
+              ?.map((s) => EraseStroke.fromJson(s as Map<String, dynamic>))
+              .toList() ??
+          const [],
+      annotations: (json['annotations'] as List<dynamic>?)
+              ?.map((a) => AnnotationElement.fromJson(a as Map<String, dynamic>))
+              .toList() ??
+          const [],
+      watermark: json['watermark'] != null
+          ? WatermarkConfig.fromJson(json['watermark'] as Map<String, dynamic>)
+          : const WatermarkConfig(),
+      redactions: (json['redactions'] as List<dynamic>?)
+              ?.map((r) => RedactionRect.fromJson(r as Map<String, dynamic>))
+              .toList() ??
+          const [],
+      resize: json['resize'] != null
+          ? PageResizeConfig.fromJson(json['resize'] as Map<String, dynamic>)
+          : const PageResizeConfig(),
+      margins: json['margins'] != null
+          ? PageMargins.fromJson(json['margins'] as Map<String, dynamic>)
+          : const PageMargins(),
+      border: json['border'] != null
+          ? PageBorder.fromJson(json['border'] as Map<String, dynamic>)
+          : const PageBorder(),
     );
   }
 }
@@ -353,6 +823,22 @@ class Folder {
     required this.createdAt,
   });
 
+  Folder copyWith({
+    String? id,
+    String? name,
+    Color? color,
+    IconData? icon,
+    DateTime? createdAt,
+  }) {
+    return Folder(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      color: color ?? this.color,
+      icon: icon ?? this.icon,
+      createdAt: createdAt ?? this.createdAt,
+    );
+  }
+
   Map<String, dynamic> toJson() => {
     'id': id,
     'name': name,
@@ -386,6 +872,7 @@ class AIMessage {
   final bool isLoading;
   final bool hasError;
   final String? quickActionType; // 'summarize', 'explain', 'extract', 'translate', 'notes'
+  final List<String>? attachedImagePaths;
 
   const AIMessage({
     required this.id,
@@ -395,6 +882,7 @@ class AIMessage {
     this.isLoading = false,
     this.hasError = false,
     this.quickActionType,
+    this.attachedImagePaths,
   });
 
   AIMessage copyWith({
@@ -405,6 +893,7 @@ class AIMessage {
     bool? isLoading,
     bool? hasError,
     String? quickActionType,
+    List<String>? attachedImagePaths,
   }) {
     return AIMessage(
       id: id ?? this.id,
@@ -414,6 +903,7 @@ class AIMessage {
       isLoading: isLoading ?? this.isLoading,
       hasError: hasError ?? this.hasError,
       quickActionType: quickActionType ?? this.quickActionType,
+      attachedImagePaths: attachedImagePaths ?? this.attachedImagePaths,
     );
   }
 }

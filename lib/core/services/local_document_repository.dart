@@ -224,6 +224,16 @@ class LocalDocumentRepository implements DocumentRepository {
   }
 
   @override
+  Future<void> renameFolder(String folderId, String newName) async {
+    await _ensureInitialized();
+    final index = _foldersCache.indexWhere((f) => f.id == folderId);
+    if (index >= 0) {
+      _foldersCache[index] = _foldersCache[index].copyWith(name: newName.trim());
+      await _persistManifest();
+    }
+  }
+
+  @override
   Future<void> deleteFolder(String folderId) async {
     await _ensureInitialized();
     _foldersCache.removeWhere((f) => f.id == folderId);

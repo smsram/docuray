@@ -1,14 +1,15 @@
-package com.docuray.docuray
+package com.smsram.docuray
 
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.os.Bundle
-import com.docuray.docuray.scanner.CornerDetector
-import com.docuray.docuray.scanner.DocScannerViewFactory
-import com.docuray.docuray.scanner.DocumentProcessingEngine
+import com.smsram.docuray.scanner.CornerDetector
+import com.smsram.docuray.scanner.DocScannerViewFactory
+import com.smsram.docuray.scanner.DocumentProcessingEngine
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import org.opencv.android.OpenCVLoader
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -16,9 +17,14 @@ class MainActivity : FlutterActivity() {
 
     private val bgExecutor = Executors.newSingleThreadExecutor()
     private var cornerDetector: CornerDetector? = null
+    private val REQUEST_CODE_SAF_CREATE = 1001
+    private var pendingSafResult: MethodChannel.Result? = null
+    private var pendingSourcePath: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Thread-safe centralized OpenCV initialization
+        DocumentProcessingEngine.initializeOpenCV()
         applySavedTheme()
     }
 
@@ -115,13 +121,86 @@ class MainActivity : FlutterActivity() {
                             )
                             runOnUiThread { result.success(resMap) }
                         }
+                        "isOpenCVAvailable" -> {
+                            val available = DocumentProcessingEngine.isOpenCVAvailable()
+                            runOnUiThread { result.success(available) }
+                        }
+                        "savePdfToDevice" -> {
+                            val sourcePath = call.argument<String>("sourcePath") ?: ""
+                            val suggestedName = call.argument<String>("suggestedName") ?: "Document.pdf"
+                            val mimeType = call.argument<String>("mimeType") ?: "application/pdf"
+
+                            val sourceFile = File(sourcePath)
+                            if (!sourceFile.exists()) {
+                                runOnUiThread { result.error("FILE_NOT_FOUND", "Source file does not exist", null) }
+                                return@execute
+                            }
+
+                            runOnUiThread {
+                                pendingSafResult = result
+                                pendingSourcePath = sourcePath
+                                try {
+                                    val intent = android.content.Intent(android.content.Intent.ACTION_CREATE_DOCUMENT).apply {
+                                        addCategory(android.content.Intent.CATEGORY_OPENABLE)
+                                        type = mimeType
+                                        putExtra(android.content.Intent.EXTRA_TITLE, suggestedName)
+                                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                            putExtra(
+                                                android.provider.DocumentsContract.EXTRA_INITIAL_URI,
+                                                android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                                            )
+                                        }
+                                    }
+                                    startActivityForResult(intent, REQUEST_CODE_SAF_CREATE)
+                                } catch (e: Exception) {
+                                    pendingSafResult = null
+                                    pendingSourcePath = null
+                                    result.error("SAF_ERROR", "Could not open system file picker: ${e.message}", null)
+                                }
+                            }
+                        }
                         else -> {
                             runOnUiThread { result.notImplemented() }
                         }
                     }
                 } catch (e: Exception) {
+                    android.util.Log.e("DocuRay", "MethodChannel error during ${call.method}", e)
                     runOnUiThread { result.error("PROCESSING_ERR", e.message, null) }
+                } catch (t: Throwable) {
+                    android.util.Log.e("DocuRay", "MethodChannel fatal error during ${call.method}", t)
+                    runOnUiThread { result.error("PROCESSING_FATAL", t.message, null) }
                 }
+            }
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_CODE_SAF_CREATE) {
+            val localResult = pendingSafResult
+            val sourcePath = pendingSourcePath
+            pendingSafResult = null
+            pendingSourcePath = null
+
+            if (resultCode == android.app.Activity.RESULT_OK && data?.data != null && sourcePath != null) {
+                val targetUri = data.data!!
+                bgExecutor.execute {
+                    try {
+                        val sourceFile = File(sourcePath)
+                        contentResolver.openOutputStream(targetUri)?.use { output ->
+                            sourceFile.inputStream().use { input ->
+                                input.copyTo(output)
+                            }
+                            output.flush()
+                        }
+                        runOnUiThread { localResult?.success(targetUri.toString()) }
+                    } catch (e: Exception) {
+                        android.util.Log.e("DocuRay", "Error writing to SAF URI: $targetUri", e)
+                        runOnUiThread { localResult?.error("IO_ERROR", "Failed to write file to device: ${e.message}", null) }
+                    }
+                }
+            } else {
+                localResult?.success(null)
             }
         }
     }

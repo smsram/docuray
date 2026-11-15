@@ -7,6 +7,7 @@ import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_typography.dart';
 import '../../core/constants/app_dimensions.dart';
 import '../../core/providers/documents_provider.dart';
+import '../../core/providers/editor_provider.dart';
 import '../../core/routing/app_router.dart';
 import '../../core/widgets/search_field.dart';
 import '../../core/widgets/app_filter_chip.dart';
@@ -28,6 +29,63 @@ class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _searchController = TextEditingController();
   bool _isSelectionMode = false;
   final Set<String> _selectedIds = {};
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkInterruptedSession();
+    });
+  }
+
+  Future<void> _checkInterruptedSession() async {
+    final hasDraft = await EditorProvider.hasRecoveryDraft();
+    if (!hasDraft || !mounted) return;
+
+    final info = await EditorProvider.getRecoveryDraftInfo();
+    final title = info?['title'] ?? 'Unsaved Scan';
+    final pageCount = info?['pageCount'] ?? 1;
+
+    if (!mounted) return;
+    final resume = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.restore_page_rounded, color: AppColors.primary),
+            SizedBox(width: 8),
+            Text('Resume Session?'),
+          ],
+        ),
+        content: Text(
+          'An interrupted editing session for "$title" ($pageCount ${pageCount == 1 ? "page" : "pages"}) was found. Would you like to resume editing where you left off or discard it?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Discard', style: TextStyle(color: AppColors.error)),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Resume Editing'),
+          ),
+        ],
+      ),
+    );
+
+    if (resume == true && mounted) {
+      final restored = await context.read<EditorProvider>().restoreFromRecoveryDraft();
+      if (restored && mounted) {
+        context.push(AppRouter.editor);
+      }
+    } else if (resume == false && mounted) {
+      await EditorProvider.discardRecoveryDraftStatic();
+      if (mounted) {
+        context.read<EditorProvider>().clearPages();
+      }
+    }
+  }
 
   @override
   void dispose() {
@@ -348,12 +406,6 @@ class _HomeScreenState extends State<HomeScreen> {
                                 label: 'PDFs',
                                 isSelected: docsProvider.filter == DocumentFilter.pdfs,
                                 onTap: () => docsProvider.setFilter(DocumentFilter.pdfs),
-                              ),
-                              const SizedBox(width: 8),
-                              AppFilterChip(
-                                label: 'Images',
-                                isSelected: docsProvider.filter == DocumentFilter.images,
-                                onTap: () => docsProvider.setFilter(DocumentFilter.images),
                               ),
                             ],
                           ),

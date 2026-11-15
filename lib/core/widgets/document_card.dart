@@ -1,10 +1,15 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:provider/provider.dart';
+import 'package:share_plus/share_plus.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_typography.dart';
 import '../constants/app_dimensions.dart';
+import '../providers/documents_provider.dart';
 import '../../models/models.dart';
 import 'app_card.dart';
+import 'confirm_dialog.dart';
 import 'document_thumbnail.dart';
 
 /// Reusable DocumentCard supporting both Grid and List layouts.
@@ -261,7 +266,7 @@ class DocumentCard extends StatelessWidget {
               ],
             ),
           ),
-          // Status indicators
+          // Status indicators & Overflow Menu
           if (!isSelectionMode) ...[
             if (document.syncMetadata.status == SyncStatus.synced)
               const Icon(
@@ -275,15 +280,228 @@ class DocumentCard extends StatelessWidget {
                 size: 18,
                 color: AppColors.primary,
               ),
-            const SizedBox(width: 4),
-            Icon(
-              Icons.chevron_right_rounded,
-              size: 20,
-              color: isDark ? AppColors.darkTextSecondary.withAlpha(120) : AppColors.textSecondary.withAlpha(100),
+            const SizedBox(width: 2),
+            PopupMenuButton<String>(
+              icon: Icon(
+                Icons.more_vert_rounded,
+                size: 20,
+                color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+              ),
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(),
+              tooltip: 'Options',
+              onSelected: (val) => _handleMenuAction(context, val),
+              itemBuilder: (ctx) => [
+                const PopupMenuItem(
+                  value: 'rename',
+                  child: Row(
+                    children: [
+                      Icon(Icons.edit_outlined, size: 18),
+                      SizedBox(width: 10),
+                      Text('Rename'),
+                    ],
+                  ),
+                ),
+                const PopupMenuItem(
+                  value: 'share',
+                  child: Row(
+                    children: [
+                      Icon(Icons.share_outlined, size: 18),
+                      SizedBox(width: 10),
+                      Text('Share'),
+                    ],
+                  ),
+                ),
+                const PopupMenuItem(
+                  value: 'move',
+                  child: Row(
+                    children: [
+                      Icon(Icons.drive_file_move_outlined, size: 18),
+                      SizedBox(width: 10),
+                      Text('Move to Folder'),
+                    ],
+                  ),
+                ),
+                PopupMenuItem(
+                  value: 'favorite',
+                  child: Row(
+                    children: [
+                      Icon(
+                        document.isFavorite ? Icons.star_rounded : Icons.star_outline_rounded,
+                        size: 18,
+                        color: document.isFavorite ? AppColors.favoriteYellow : null,
+                      ),
+                      const SizedBox(width: 10),
+                      Text(document.isFavorite ? 'Remove Favorite' : 'Add to Favorites'),
+                    ],
+                  ),
+                ),
+                const PopupMenuDivider(),
+                const PopupMenuItem(
+                  value: 'delete',
+                  child: Row(
+                    children: [
+                      Icon(Icons.delete_outline_rounded, size: 18, color: AppColors.error),
+                      SizedBox(width: 10),
+                      Text('Delete', style: TextStyle(color: AppColors.error)),
+                    ],
+                  ),
+                ),
+              ],
             ),
           ],
         ],
       ),
     );
+  }
+
+  void _handleMenuAction(BuildContext context, String action) {
+    final provider = context.read<DocumentsProvider>();
+    switch (action) {
+      case 'rename':
+        _showRenameDialog(context, provider);
+        break;
+      case 'share':
+        _shareDocument(context);
+        break;
+      case 'move':
+        _showMoveToFolderSheet(context, provider);
+        break;
+      case 'favorite':
+        provider.toggleFavorite(document.id);
+        break;
+      case 'delete':
+        _deleteDocument(context, provider);
+        break;
+    }
+  }
+
+  void _showRenameDialog(BuildContext context, DocumentsProvider provider) {
+    final controller = TextEditingController(text: document.title);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Rename Document'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: 'Document title'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              final newTitle = controller.text.trim();
+              if (newTitle.isNotEmpty && newTitle != document.title) {
+                provider.renameDocument(document.id, newTitle);
+              }
+              Navigator.pop(ctx);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _shareDocument(BuildContext context) async {
+    if (document.pdfPath != null) {
+      final f = File(document.pdfPath!);
+      if (await f.exists()) {
+        await SharePlus.instance.share(
+          ShareParams(
+            files: [XFile(f.path, name: '${document.title}.pdf', mimeType: 'application/pdf')],
+            text: document.title,
+          ),
+        );
+        return;
+      }
+    }
+    // Fallback to images
+    final imageFiles = <XFile>[];
+    for (final p in document.pages) {
+      final path = p.processedImagePath ?? p.originalImagePath;
+      if (path != null && await File(path).exists()) {
+        imageFiles.add(XFile(path, mimeType: 'image/jpeg'));
+      }
+    }
+    if (imageFiles.isNotEmpty) {
+      await SharePlus.instance.share(
+        ShareParams(files: imageFiles, text: document.title),
+      );
+    }
+  }
+
+  void _showMoveToFolderSheet(BuildContext context, DocumentsProvider provider) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(borderRadius: AppDimensions.borderSheet),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                child: Text(
+                  'Move to Folder',
+                  style: AppTypography.subsectionTitle.copyWith(
+                    color: isDark ? AppColors.darkText : AppColors.textPrimary,
+                  ),
+                ),
+              ),
+              ListTile(
+                leading: const Icon(Icons.home_outlined),
+                title: const Text('None (Root Library)'),
+                trailing: document.folderId == null
+                    ? const Icon(Icons.check_rounded, color: AppColors.primary)
+                    : null,
+                onTap: () {
+                  provider.moveDocument(document.id, null);
+                  Navigator.pop(ctx);
+                },
+              ),
+              ...provider.folders.map((f) {
+                return ListTile(
+                  leading: Icon(f.icon, color: f.color),
+                  title: Text(f.name),
+                  trailing: document.folderId == f.id
+                      ? const Icon(Icons.check_rounded, color: AppColors.primary)
+                      : null,
+                  onTap: () {
+                    provider.moveDocument(document.id, f.id);
+                    Navigator.pop(ctx);
+                  },
+                );
+              }),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _deleteDocument(BuildContext context, DocumentsProvider provider) async {
+    final confirm = await ConfirmDialog.show(
+      context,
+      title: 'Delete "${document.title}"?',
+      message: 'This document and its scanned pages will be permanently deleted.',
+      confirmLabel: 'Delete',
+      isDestructive: true,
+    );
+    if (confirm == true) {
+      await provider.deleteDocument(document.id);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Deleted "${document.title}".')),
+        );
+      }
+    }
   }
 }

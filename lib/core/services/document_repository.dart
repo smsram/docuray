@@ -11,5 +11,6 @@ abstract class DocumentRepository {
   Future<void> moveDocument(String id, String? folderId);
   Future<List<Folder>> getFolders();
   Future<void> createFolder(Folder folder);
+  Future<void> renameFolder(String folderId, String newName);
   Future<void> deleteFolder(String folderId);
 }

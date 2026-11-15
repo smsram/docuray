@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:provider/provider.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_typography.dart';
@@ -83,7 +84,7 @@ class SettingsScreen extends StatelessWidget {
                   SettingTile(
                     icon: Icons.auto_awesome_rounded,
                     title: 'AI Assistant',
-                    subtitle: 'Powered by Google Gemini',
+                    subtitle: 'Powered by Qwen3-VL-8B (ZeroGPU)',
                     trailing: Text(
                       'Configure',
                       style: AppTypography.buttonSmall.copyWith(
@@ -104,10 +105,18 @@ class SettingsScreen extends StatelessWidget {
                 children: [
                   ToggleSettingTile(
                     icon: Icons.flash_auto_rounded,
-                    title: 'Auto Capture',
-                    subtitle: 'Automatically take photo when corners detected',
-                    value: settings.autoCapture,
-                    onChanged: settings.setAutoCapture,
+                    title: 'Auto Capture Default',
+                    subtitle: 'Automatically take photo when document is steady',
+                    value: settings.autoCaptureDefault,
+                    onChanged: settings.setAutoCaptureDefault,
+                  ),
+                  const Divider(),
+                  ToggleSettingTile(
+                    icon: Icons.crop_rounded,
+                    title: 'Auto Crop Default',
+                    subtitle: 'Automatically crop to detected document corners',
+                    value: settings.autoCropDefault,
+                    onChanged: settings.setAutoCropDefault,
                   ),
                   const Divider(),
                   ToggleSettingTile(
@@ -182,7 +191,7 @@ class SettingsScreen extends StatelessWidget {
                   SettingTile(
                     icon: Icons.pie_chart_outline_rounded,
                     title: 'Storage',
-                    subtitle: '128 MB used · Local storage metrics',
+                    subtitle: 'Local document and cache metrics',
                     onTap: () => context.push(AppRouter.storage),
                   ),
                   const Divider(),
@@ -197,8 +206,65 @@ class SettingsScreen extends StatelessWidget {
                     icon: Icons.title_rounded,
                     title: 'Auto Naming',
                     subtitle: 'Generate document titles using date & time',
-                    value: true,
-                    onChanged: (v) {},
+                    value: settings.autoNaming,
+                    onChanged: settings.setAutoNaming,
+                  ),
+                ],
+              ),
+            ),
+
+            // ─── 6. REMEMBER EDITING PREFERENCES ────────────────────
+            const SettingsSectionHeader(title: 'Remember Editing Preferences'),
+            AppCard(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Column(
+                children: [
+                  ToggleSettingTile(
+                    icon: Icons.filter_b_and_w_rounded,
+                    title: 'Remember Filter',
+                    subtitle: 'Apply last-used filter to new scans (Default: Original)',
+                    value: settings.rememberFilter,
+                    onChanged: settings.setRememberFilter,
+                  ),
+                  const Divider(),
+                  ToggleSettingTile(
+                    icon: Icons.tune_rounded,
+                    title: 'Remember Adjustments',
+                    subtitle: 'Retain custom brightness, contrast, highlights, etc.',
+                    value: settings.rememberAdjustments,
+                    onChanged: settings.setRememberAdjustments,
+                  ),
+                  const Divider(),
+                  ToggleSettingTile(
+                    icon: Icons.aspect_ratio_rounded,
+                    title: 'Remember Resize',
+                    subtitle: 'Retain chosen paper size (e.g. A4, Letter)',
+                    value: settings.rememberResize,
+                    onChanged: settings.setRememberResize,
+                  ),
+                  const Divider(),
+                  ToggleSettingTile(
+                    icon: Icons.space_dashboard_outlined,
+                    title: 'Remember Margins',
+                    subtitle: 'Retain custom page margin dimensions',
+                    value: settings.rememberMargins,
+                    onChanged: settings.setRememberMargins,
+                  ),
+                  const Divider(),
+                  ToggleSettingTile(
+                    icon: Icons.border_all_rounded,
+                    title: 'Remember Border',
+                    subtitle: 'Retain document border configuration',
+                    value: settings.rememberBorder,
+                    onChanged: settings.setRememberBorder,
+                  ),
+                  const Divider(),
+                  ToggleSettingTile(
+                    icon: Icons.branding_watermark_rounded,
+                    title: 'Remember Watermark',
+                    subtitle: 'Save watermark template (disabled on new scans by default)',
+                    value: settings.rememberWatermark,
+                    onChanged: settings.setRememberWatermark,
                   ),
                 ],
               ),
@@ -245,32 +311,15 @@ class SettingsScreen extends StatelessWidget {
               ),
             ),
 
-            // ─── 7. PRIVACY & SECURITY ───────────────────────────────
-            const SettingsSectionHeader(title: 'Privacy & Security'),
+            // ─── 7. PRIVACY & PERMISSIONS ───────────────────────────
+            const SettingsSectionHeader(title: 'Permissions & Privacy'),
             AppCard(
               padding: const EdgeInsets.symmetric(vertical: 4),
               child: Column(
                 children: [
-                  ToggleSettingTile(
-                    icon: Icons.lock_outline_rounded,
-                    title: 'App Lock',
-                    subtitle: 'Require authentication when opening DocuRay',
-                    value: settings.appLock,
-                    onChanged: settings.setAppLock,
-                  ),
-                  const Divider(),
-                  ToggleSettingTile(
-                    icon: Icons.fingerprint_rounded,
-                    title: 'Biometric Unlock',
-                    subtitle: 'Use fingerprint or face recognition',
-                    value: settings.biometricLock,
-                    enabled: settings.appLock,
-                    onChanged: settings.setBiometricLock,
-                  ),
-                  const Divider(),
                   SettingTile(
                     icon: Icons.shield_outlined,
-                    title: 'Permissions',
+                    title: 'App Permissions',
                     subtitle: 'Camera, Photos, and storage access',
                     onTap: () => context.push(AppRouter.permissions),
                   ),
@@ -284,11 +333,17 @@ class SettingsScreen extends StatelessWidget {
               padding: const EdgeInsets.symmetric(vertical: 4),
               child: Column(
                 children: [
-                  SettingTile(
-                    icon: Icons.info_outline_rounded,
-                    title: 'About DocuRay',
-                    subtitle: 'Version 1.0.0 (Build 1)',
-                    onTap: () => context.push(AppRouter.about),
+                  FutureBuilder<PackageInfo>(
+                    future: PackageInfo.fromPlatform(),
+                    builder: (context, snapshot) {
+                      final version = snapshot.data?.version ?? '1.0.0';
+                      return SettingTile(
+                        icon: Icons.info_outline_rounded,
+                        title: 'About DocuRay',
+                        subtitle: 'Version $version',
+                        onTap: () => context.push(AppRouter.about),
+                      );
+                    },
                   ),
                   const Divider(),
                   SettingTile(

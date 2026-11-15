@@ -11,6 +11,17 @@ class NativeScannerService {
 
   static bool get isNativeSupported => !kIsWeb && Platform.isAndroid;
 
+  /// Checks whether native OpenCV is loaded and ready for document processing
+  static Future<bool> isOpenCVAvailable() async {
+    if (!isNativeSupported) return false;
+    try {
+      final res = await _processingChannel.invokeMethod<bool>('isOpenCVAvailable');
+      return res ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Unified single-pass native pipeline for real-time preview and export:
   /// EXIF rotation -> Homography warp -> Rotation -> Filter -> Adjustments -> Compression
   static Future<String?> processPage(
@@ -156,6 +167,29 @@ class NativeScannerService {
     } catch (e) {
       debugPrint('[NativeScannerService] adjustImage error: $e');
       return null;
+    }
+  }
+
+  /// Saves a file to the user's Android device storage (Downloads / Documents) via SAF.
+  static Future<String?> savePdfToDevice({
+    required String sourcePath,
+    required String suggestedName,
+    String mimeType = 'application/pdf',
+  }) async {
+    if (!isNativeSupported) return null;
+    try {
+      final res = await _processingChannel.invokeMethod<String>(
+        'savePdfToDevice',
+        {
+          'sourcePath': sourcePath,
+          'suggestedName': suggestedName,
+          'mimeType': mimeType,
+        },
+      );
+      return res;
+    } catch (e) {
+      debugPrint('[NativeScannerService] savePdfToDevice error: $e');
+      rethrow;
     }
   }
 }

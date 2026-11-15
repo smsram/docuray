@@ -106,5 +106,7 @@ class MockEmptyDocumentRepository implements DocumentRepository {
   @override
   Future<void> createFolder(Folder folder) async {}
   @override
+  Future<void> renameFolder(String folderId, String newName) async {}
+  @override
   Future<void> deleteFolder(String folderId) async {}
 }

@@ -218,12 +218,6 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
                         ),
                         const SizedBox(width: 8),
                         AppFilterChip(
-                          label: 'Images',
-                          isSelected: docsProvider.filter == DocumentFilter.images,
-                          onTap: () => docsProvider.setFilter(DocumentFilter.images),
-                        ),
-                        const SizedBox(width: 8),
-                        AppFilterChip(
                           label: 'Favorites',
                           icon: Icons.star_rounded,
                           isSelected: docsProvider.filter == DocumentFilter.favorites,

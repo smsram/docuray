@@ -1,4 +1,4 @@
-package com.docuray.docuray.scanner
+package com.smsram.docuray.scanner
 
 import kotlin.math.hypot
 import kotlin.math.max

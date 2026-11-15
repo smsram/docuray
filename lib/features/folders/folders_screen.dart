@@ -7,6 +7,7 @@ import '../../core/constants/app_dimensions.dart';
 import '../../core/providers/documents_provider.dart';
 import '../../core/widgets/app_card.dart';
 import '../../core/widgets/confirm_dialog.dart';
+import '../../core/widgets/document_card.dart';
 import '../../models/models.dart';
 
 /// Screen 15: Folders Management Screen with Create, Rename, and Delete folder support.
@@ -105,10 +106,14 @@ class FoldersScreen extends StatelessWidget {
           ),
           ElevatedButton(
             onPressed: () {
+              final newName = controller.text.trim();
+              if (newName.isNotEmpty && newName != folder.name) {
+                provider.renameFolder(folder.id, newName);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Folder renamed.')),
+                );
+              }
               Navigator.pop(ctx);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Folder renamed.')),
-              );
             },
             child: const Text('Save'),
           ),
@@ -150,10 +155,7 @@ class FoldersScreen extends StatelessWidget {
 
             return AppCard(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-              onTap: () {
-                // Filter documents by this folder or view
-                context.pop();
-              },
+              onTap: () => _openFolderContents(context, f),
               child: Row(
                 children: [
                   Container(
@@ -196,6 +198,84 @@ class FoldersScreen extends StatelessWidget {
             );
           },
         ),
+      ),
+    );
+  }
+
+  void _openFolderContents(BuildContext context, Folder folder) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (ctx) => _FolderContentsScreen(folder: folder),
+      ),
+    );
+  }
+}
+
+class _FolderContentsScreen extends StatelessWidget {
+  final Folder folder;
+
+  const _FolderContentsScreen({required this.folder});
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final docsProvider = context.watch<DocumentsProvider>();
+    final docsInFolder = docsProvider.documents.where((d) => d.folderId == folder.id).toList();
+
+    return Scaffold(
+      backgroundColor: isDark ? AppColors.darkBackground : AppColors.background,
+      appBar: AppBar(
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back_rounded),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Row(
+          children: [
+            Icon(folder.icon, color: folder.color, size: 20),
+            const SizedBox(width: 8),
+            Text(folder.name),
+          ],
+        ),
+      ),
+      body: SafeArea(
+        child: docsInFolder.isEmpty
+            ? Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.folder_open_rounded,
+                      size: 48,
+                      color: isDark ? AppColors.darkTextSecondary.withAlpha(120) : AppColors.textSecondary.withAlpha(120),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'This folder is empty',
+                      style: AppTypography.subsectionTitle.copyWith(
+                        color: isDark ? AppColors.darkText : AppColors.textPrimary,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Move documents here using the options menu on any document.',
+                      style: AppTypography.secondary,
+                    ),
+                  ],
+                ),
+              )
+            : ListView.separated(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 80),
+                itemCount: docsInFolder.length,
+                separatorBuilder: (context, index) => const SizedBox(height: 12),
+                itemBuilder: (context, index) {
+                  final doc = docsInFolder[index];
+                  return DocumentCard(
+                    document: doc,
+                    isGrid: false,
+                    onTap: () => context.push('/viewer/${doc.id}'),
+                  );
+                },
+              ),
       ),
     );
   }

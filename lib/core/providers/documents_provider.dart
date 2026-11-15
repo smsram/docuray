@@ -1,13 +1,14 @@
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../models/models.dart';
 import '../services/document_repository.dart';
 import '../services/local_document_repository.dart';
+import '../services/google_drive_service.dart';
 import '../data/sample_data.dart';
 
 enum DocumentFilter {
   all,
   pdfs,
-  images,
   favorites,
 }
 
@@ -31,7 +32,7 @@ class DocumentsProvider extends ChangeNotifier {
   bool _isLoading = true;
 
   DocumentFilter _filter = DocumentFilter.all;
-  DocumentViewMode _viewMode = DocumentViewMode.grid;
+  DocumentViewMode _viewMode = DocumentViewMode.list;
   DocumentSort _sort = DocumentSort.recent;
   String _searchQuery = '';
 
@@ -71,9 +72,6 @@ class DocumentsProvider extends ChangeNotifier {
       case DocumentFilter.pdfs:
         result = result.where((d) => d.format == DocumentFormat.pdf).toList();
         break;
-      case DocumentFilter.images:
-        result = result.where((d) => d.format == DocumentFormat.image).toList();
-        break;
       case DocumentFilter.favorites:
         result = result.where((d) => d.isFavorite).toList();
         break;
@@ -109,6 +107,16 @@ class DocumentsProvider extends ChangeNotifier {
     _isLoading = true;
     notifyListeners();
 
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final savedView = prefs.getString('document_view_mode');
+      if (savedView == 'grid') {
+        _viewMode = DocumentViewMode.grid;
+      } else {
+        _viewMode = DocumentViewMode.list;
+      }
+    } catch (_) {}
+
     _documents = await _repository.getAllDocuments();
     _folders = await _repository.getFolders();
 
@@ -138,9 +146,13 @@ class DocumentsProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  void setViewMode(DocumentViewMode mode) {
+  Future<void> setViewMode(DocumentViewMode mode) async {
     _viewMode = mode;
     notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('document_view_mode', mode == DocumentViewMode.grid ? 'grid' : 'list');
+    } catch (_) {}
   }
 
   void setSort(DocumentSort sort) {
@@ -182,9 +194,17 @@ class DocumentsProvider extends ChangeNotifier {
   }
 
   // CRUD actions
-  Future<void> addDocument(Document document) async {
+  Future<void> addDocument(Document document, {bool autoBackup = false, bool wifiOnly = false, bool includeMetadata = true}) async {
     await _repository.saveDocument(document);
     await loadData();
+
+    if (autoBackup && GoogleDriveService.instance.isSignedIn) {
+      GoogleDriveService.instance.backupSingleDocument(
+        document,
+        wifiOnly: wifiOnly,
+        includeMetadata: includeMetadata,
+      ).then((_) => loadData()).catchError((_) {});
+    }
   }
 
   Future<void> renameDocument(String id, String newTitle) async {
@@ -239,6 +259,11 @@ class DocumentsProvider extends ChangeNotifier {
       createdAt: DateTime.now(),
     );
     await _repository.createFolder(folder);
+    await loadData();
+  }
+
+  Future<void> renameFolder(String folderId, String newName) async {
+    await _repository.renameFolder(folderId, newName);
     await loadData();
   }
 

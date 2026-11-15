@@ -46,3 +46,11 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# OAuth and local credentials (keep confidential files out of version control)
+oauth.json
+*client_secret*.json
+google-services.json
+GoogleService-Info.plist
+*.keystore
+!debug.keystore

@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:go_router/go_router.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_typography.dart';
 import '../../core/constants/app_dimensions.dart';
@@ -31,27 +33,25 @@ class AboutScreen extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               const SizedBox(height: 24),
-              // App Logo
+              // App Logo with white background
               Container(
-                width: 72,
-                height: 72,
+                width: 80,
+                height: 80,
                 decoration: BoxDecoration(
-                  color: isDark ? AppColors.darkPrimary : AppColors.primary,
-                  borderRadius: BorderRadius.circular(18),
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(20),
                   boxShadow: [
                     BoxShadow(
-                      color: (isDark ? AppColors.darkPrimary : AppColors.primary).withAlpha(60),
+                      color: Colors.black.withAlpha(isDark ? 60 : 25),
                       blurRadius: 16,
                       offset: const Offset(0, 4),
                     ),
                   ],
                 ),
-                child: const Center(
-                  child: Icon(
-                    Icons.document_scanner_rounded,
-                    size: 38,
-                    color: Colors.white,
-                  ),
+                padding: const EdgeInsets.all(8),
+                child: SvgPicture.asset(
+                  'assets/branding/docuray_logo_bg.svg',
+                  fit: BoxFit.contain,
                 ),
               ),
               const SizedBox(height: 16),
@@ -72,11 +72,17 @@ class AboutScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 6),
-              Text(
-                'Version 1.0.0 (Build 1)',
-                style: AppTypography.caption.copyWith(
-                  color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
-                ),
+              FutureBuilder<PackageInfo>(
+                future: PackageInfo.fromPlatform(),
+                builder: (context, snapshot) {
+                  final version = snapshot.data?.version ?? '1.0.0';
+                  return Text(
+                    'Version $version',
+                    style: AppTypography.caption.copyWith(
+                      color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+                    ),
+                  );
+                },
               ),
               const SizedBox(height: 32),
 

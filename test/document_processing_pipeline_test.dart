@@ -175,27 +175,26 @@ void main() {
       expect(bluePixel.b, greaterThan(bluePixel.r + 60));
     });
 
-    test('6. BLACK & WHITE with Sauvola local thresholding is binary and avoids shadow blotches', () {
+    test('6. BLACK & WHITE with bilateral filter and sigmoid contrast avoids shadow blotches', () {
       final bw = ImageEnhancer.process(source: testDoc, filterType: 'bw');
 
-      // (a) All pixels must be strictly binary: 0 or 255
+      // (a) All pixels must be monochrome grayscale
       for (int y = 0; y < bw.height; y += 30) {
         for (int x = 0; x < bw.width; x += 30) {
           final p = bw.getPixel(x, y);
-          expect(p.r == 0 || p.r == 255, isTrue);
           expect(p.r, equals(p.g));
           expect(p.g, equals(p.b));
         }
       }
 
-      // (b) Shadow area paper background (x=350, y=550) must NOT turn black!
-      // Sauvola local standard deviation adaptation prevents false shadow blotches.
+      // (b) Shadow area paper background (x=350, y=550) must NOT turn dark!
+      // Illumination normalization + bilateral filtering preserves clean paper
       final shadowBgPixel = bw.getPixel(350, 550);
-      expect(shadowBgPixel.r, equals(255)); // White paper
+      expect(shadowBgPixel.r, greaterThanOrEqualTo(240));
 
-      // (c) Dark printed text stroke (x=50, y=50) must be 0 (black text)
+      // (c) Dark printed text stroke (x=50, y=50) must be dark ink
       final textPixel = bw.getPixel(50, 50);
-      expect(textPixel.r, equals(0));
+      expect(textPixel.r, lessThanOrEqualTo(25));
     });
 
     test('7. All six filter presets produce genuinely different, appropriate results', () {

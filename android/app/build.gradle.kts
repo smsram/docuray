@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.docuray.docuray"
+    namespace = "com.smsram.docuray"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -16,7 +16,7 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.docuray.docuray"
+        applicationId = "com.smsram.docuray"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -56,4 +56,5 @@ dependencies {
     implementation("androidx.camera:camera-view:1.3.4")
     implementation("com.google.ai.edge.litert:litert:1.4.0")
     implementation("com.google.ai.edge.litert:litert-gpu:1.4.0")
+    implementation("org.opencv:opencv:4.10.0")
 }

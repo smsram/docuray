@@ -45,6 +45,8 @@ abstract class AppRouter {
   static const String about = '/settings/about';
   static const String licenses = '/settings/licenses';
 
+  static final RouteObserver<ModalRoute<void>> routeObserver = RouteObserver<ModalRoute<void>>();
+
   static GoRouter get router => _router;
   static final GoRouter _router = createRouter();
 
@@ -57,6 +59,7 @@ abstract class AppRouter {
 
     return GoRouter(
       navigatorKey: rootKey,
+      observers: [routeObserver],
       initialLocation: initialLocation,
       routes: [
         // Splash screen
@@ -152,7 +155,9 @@ abstract class AppRouter {
           parentNavigatorKey: rootKey,
           builder: (context, state) {
             final id = state.pathParameters['id'] ?? '';
-            return AiAssistantScreen(documentId: id);
+            final extra = state.extra as Map<String, dynamic>?;
+            final pageIndex = extra?['pageIndex'] as int? ?? 0;
+            return AiAssistantScreen(documentId: id, initialPageIndex: pageIndex);
           },
         ),
 

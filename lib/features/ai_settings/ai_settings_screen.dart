@@ -1,15 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
+import 'package:http/http.dart' as http;
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_typography.dart';
 import '../../core/constants/app_dimensions.dart';
-import '../../core/providers/settings_provider.dart';
+import '../../core/providers/ai_provider.dart';
+import '../../core/services/hf_vision_service.dart';
 import '../../core/widgets/app_card.dart';
 import '../../core/widgets/app_buttons.dart';
 
-/// Screen 12: AI Assistant Configuration Screen with Gemini provider, API configuration options,
-/// and clear disclaimer that it is separate from Google Drive.
+/// Screen 12: AI Assistant Configuration & Status Screen.
+/// Displays Qwen3-VL-8B model status, ZeroGPU endpoints, daily 120s allowance metrics,
+/// and live connectivity verification.
 class AiSettingsScreen extends StatefulWidget {
   const AiSettingsScreen({super.key});
 
@@ -18,12 +21,50 @@ class AiSettingsScreen extends StatefulWidget {
 }
 
 class _AiSettingsScreenState extends State<AiSettingsScreen> {
-  int _selectedMethod = 0; // 0 = Google/Gemini Access, 1 = User API Key
+  bool _isTestingConnection = false;
+  String? _testResult;
+  bool _testSuccess = false;
+
+  Future<void> _testConnection() async {
+    setState(() {
+      _isTestingConnection = true;
+      _testResult = null;
+    });
+
+    try {
+      final res = await http.get(
+        Uri.parse('${HfVisionService.baseUrl}/gradio_api/info'),
+      ).timeout(const Duration(seconds: 10));
+
+      if (res.statusCode == 200) {
+        setState(() {
+          _testSuccess = true;
+          _testResult = 'Connected to Qwen3-VL-8B ZeroGPU Space successfully.';
+        });
+      } else {
+        setState(() {
+          _testSuccess = false;
+          _testResult = 'Space responded with HTTP ${res.statusCode}.';
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _testSuccess = false;
+        _testResult = 'Unable to reach AI service: $e';
+      });
+    } finally {
+      setState(() => _isTestingConnection = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final settings = context.watch<SettingsProvider>();
+    final aiProvider = context.watch<AiProvider>();
+    final remainingSecs = aiProvider.remainingSecondsToday;
+    final usedSecs = aiProvider.usedSecondsToday;
+    final progress = aiProvider.usageProgress;
+    final isExhausted = aiProvider.isAllowanceExhausted;
 
     return Scaffold(
       backgroundColor: isDark ? AppColors.darkBackground : AppColors.background,
@@ -64,7 +105,7 @@ class _AiSettingsScreenState extends State<AiSettingsScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Separate from Google Drive',
+                            'Independent from Google Drive',
                             style: AppTypography.bodyMedium.copyWith(
                               color: isDark ? AppColors.darkText : const Color(0xFF1E3A8A),
                               fontWeight: FontWeight.w700,
@@ -72,7 +113,8 @@ class _AiSettingsScreenState extends State<AiSettingsScreen> {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            'Document AI uses Google Gemini to answer questions about your scans. Connecting Google Drive for backup does NOT automatically grant Gemini API quota.',
+                            'DocuRay AI runs on high-performance Qwen3-VL-8B via ZeroGPU. '
+                            'Using AI does not consume your Google Drive storage or require Google Cloud credentials.',
                             style: AppTypography.secondary.copyWith(
                               color: isDark ? AppColors.darkTextSecondary : const Color(0xFF1E40AF),
                               height: 1.4,
@@ -86,9 +128,9 @@ class _AiSettingsScreenState extends State<AiSettingsScreen> {
               ),
               const SizedBox(height: 24),
 
-              // Status Card
+              // Active AI Model Status Card
               Text(
-                'CONNECTION STATUS',
+                'AI MODEL & ENGINE',
                 style: AppTypography.badge.copyWith(
                   color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
                   letterSpacing: 1.0,
@@ -97,65 +139,75 @@ class _AiSettingsScreenState extends State<AiSettingsScreen> {
               const SizedBox(height: 10),
               AppCard(
                 padding: const EdgeInsets.all(16),
-                child: Row(
+                child: Column(
                   children: [
-                    Container(
-                      width: 44,
-                      height: 44,
-                      decoration: BoxDecoration(
-                        color: isDark ? const Color(0xFF262C34) : const Color(0xFFF1F5F9),
-                        shape: BoxShape.circle,
-                      ),
-                      child: Icon(
-                        Icons.smart_toy_outlined,
-                        size: 24,
-                        color: isDark ? AppColors.darkPrimary : AppColors.primary,
-                      ),
-                    ),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            settings.aiProvider,
-                            style: AppTypography.bodyMedium.copyWith(
-                              color: isDark ? AppColors.darkText : AppColors.textPrimary,
-                              fontWeight: FontWeight.w700,
-                            ),
+                    Row(
+                      children: [
+                        Container(
+                          width: 44,
+                          height: 44,
+                          decoration: BoxDecoration(
+                            color: isDark ? const Color(0xFF262C34) : const Color(0xFFF1F5F9),
+                            shape: BoxShape.circle,
                           ),
-                          const SizedBox(height: 2),
-                          Row(
+                          child: Icon(
+                            Icons.smart_toy_rounded,
+                            size: 24,
+                            color: isDark ? AppColors.darkPrimary : AppColors.primary,
+                          ),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Container(
-                                width: 8,
-                                height: 8,
-                                decoration: const BoxDecoration(
-                                  color: AppColors.warning,
-                                  shape: BoxShape.circle,
+                              Text(
+                                'Qwen3-VL-8B Vision',
+                                style: AppTypography.bodyMedium.copyWith(
+                                  color: isDark ? AppColors.darkText : AppColors.textPrimary,
+                                  fontWeight: FontWeight.w700,
                                 ),
                               ),
-                              const SizedBox(width: 6),
-                              Text(
-                                'Not configured (Phase 1)',
-                                style: AppTypography.secondary.copyWith(
-                                  color: AppColors.warning,
-                                  fontWeight: FontWeight.w600,
-                                ),
+                              const SizedBox(height: 2),
+                              Row(
+                                children: [
+                                  Container(
+                                    width: 8,
+                                    height: 8,
+                                    decoration: const BoxDecoration(
+                                      color: AppColors.success,
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    'Active (ZeroGPU Accelerated)',
+                                    style: AppTypography.secondary.copyWith(
+                                      color: AppColors.success,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ],
                           ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
+                    const Divider(height: 24),
+                    _buildInfoRow('Endpoint', 'smsram-zerogpu.hf.space', isDark),
+                    const SizedBox(height: 8),
+                    _buildInfoRow('Architecture', 'Multimodal Vision-Language (8B)', isDark),
+                    const SizedBox(height: 8),
+                    _buildInfoRow('Stream Format', 'Server-Sent Events (SSE)', isDark),
                   ],
                 ),
               ),
               const SizedBox(height: 24),
 
-              // Configuration Choices (Future Architecture)
+              // Free Daily Usage Allowance Card
               Text(
-                'FUTURE INTEGRATION CHOICES',
+                'DAILY FREE ALLOWANCE',
                 style: AppTypography.badge.copyWith(
                   color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
                   letterSpacing: 1.0,
@@ -163,77 +215,142 @@ class _AiSettingsScreenState extends State<AiSettingsScreen> {
               ),
               const SizedBox(height: 10),
               AppCard(
-                padding: const EdgeInsets.symmetric(vertical: 4),
+                padding: const EdgeInsets.all(16),
                 child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _buildMethodTile(
-                      title: 'Google / Gemini Access',
-                      subtitle: 'Connect with Google account and AI Studio permissions',
-                      isSelected: _selectedMethod == 0,
-                      onTap: () => setState(() => _selectedMethod = 0),
-                      isDark: isDark,
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          'Daily Quota',
+                          style: AppTypography.bodyMedium.copyWith(
+                            color: isDark ? AppColors.darkText : AppColors.textPrimary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Text(
+                          '${usedSecs}s / 120s used',
+                          style: AppTypography.caption.copyWith(
+                            color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
                     ),
-                    const Divider(),
-                    _buildMethodTile(
-                      title: 'Custom Gemini API Key',
-                      subtitle: 'Bring your own personal Gemini API key from AI Studio',
-                      isSelected: _selectedMethod == 1,
-                      onTap: () => setState(() => _selectedMethod = 1),
-                      isDark: isDark,
+                    const SizedBox(height: 10),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(4),
+                      child: LinearProgressIndicator(
+                        value: progress,
+                        minHeight: 8,
+                        backgroundColor: isDark ? const Color(0xFF262C34) : const Color(0xFFE2E8F0),
+                        valueColor: AlwaysStoppedAnimation<Color>(
+                          isExhausted
+                              ? AppColors.error
+                              : (remainingSecs <= 30 ? AppColors.warning : AppColors.success),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          isExhausted
+                              ? 'Quota exhausted for today'
+                              : '$remainingSecs seconds remaining',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: isExhausted
+                                ? AppColors.error
+                                : (isDark ? AppColors.darkText : AppColors.textPrimary),
+                          ),
+                        ),
+                        Text(
+                          'Resets at midnight',
+                          style: AppTypography.caption.copyWith(
+                            color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),
               ),
-              const SizedBox(height: 20),
+              const SizedBox(height: 24),
 
-              // Key input placeholder if method 1 selected
-              if (_selectedMethod == 1) ...[
-                Text(
-                  'API KEY CONFIGURATION',
-                  style: AppTypography.badge.copyWith(
-                    color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
-                    letterSpacing: 1.0,
-                  ),
+              // Connection Test & Diagnostics
+              Text(
+                'SERVICE DIAGNOSTICS',
+                style: AppTypography.badge.copyWith(
+                  color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+                  letterSpacing: 1.0,
                 ),
-                const SizedBox(height: 10),
-                AppCard(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const TextField(
-                        obscureText: true,
-                        decoration: InputDecoration(
-                          hintText: 'Enter Gemini API key (AIzaSy...)',
-                          prefixIcon: Icon(Icons.key_rounded, size: 20),
-                        ),
+              ),
+              const SizedBox(height: 10),
+              AppCard(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Test ZeroGPU Connection',
+                      style: AppTypography.bodyMedium.copyWith(
+                        color: isDark ? AppColors.darkText : AppColors.textPrimary,
+                        fontWeight: FontWeight.w600,
                       ),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Keys are stored securely in local device Keystore and never sent to external servers.',
-                        style: AppTypography.caption.copyWith(
-                          color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Verifies handshake with Hugging Face ZeroGPU endpoint.',
+                      style: AppTypography.secondary.copyWith(
+                        color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+                      ),
+                    ),
+                    if (_testResult != null) ...[
+                      const SizedBox(height: 12),
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: _testSuccess
+                              ? (isDark ? const Color(0xFF14532D) : const Color(0xFFDCFCE7))
+                              : (isDark ? const Color(0xFF7F1D1D) : const Color(0xFFFEE2E2)),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(
+                              _testSuccess ? Icons.check_circle_rounded : Icons.error_outline_rounded,
+                              size: 16,
+                              color: _testSuccess ? AppColors.success : AppColors.error,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                _testResult!,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: _testSuccess
+                                      ? (isDark ? const Color(0xFFBBF7D0) : const Color(0xFF166534))
+                                      : (isDark ? const Color(0xFFFECACA) : const Color(0xFF991B1B)),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ],
-                  ),
-                ),
-                const SizedBox(height: 20),
-              ],
-
-              // Save button
-              PrimaryButton(
-                label: 'Save Configuration',
-                width: double.infinity,
-                icon: Icons.check_circle_outline_rounded,
-                onPressed: () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Configuration saved. Real API authentication is enabled in Phase 2.'),
-                      behavior: SnackBarBehavior.floating,
+                    const SizedBox(height: 14),
+                    PrimaryButton(
+                      label: _isTestingConnection ? 'Testing Handshake...' : 'Test Connection',
+                      icon: _isTestingConnection ? null : Icons.network_check_rounded,
+                      width: double.infinity,
+                      onPressed: _isTestingConnection ? null : _testConnection,
                     ),
-                  );
-                },
+                  ],
+                ),
               ),
             ],
           ),
@@ -242,42 +359,24 @@ class _AiSettingsScreenState extends State<AiSettingsScreen> {
     );
   }
 
-  Widget _buildMethodTile({
-    required String title,
-    required String subtitle,
-    required bool isSelected,
-    required VoidCallback onTap,
-    required bool isDark,
-  }) {
-    return ListTile(
-      title: Text(
-        title,
-        style: AppTypography.bodyMedium.copyWith(
-          color: isDark ? AppColors.darkText : AppColors.textPrimary,
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-      subtitle: Text(
-        subtitle,
-        style: AppTypography.secondary.copyWith(
-          color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
-        ),
-      ),
-      trailing: Container(
-        width: 20,
-        height: 20,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          border: Border.all(
-            color: isSelected
-                ? (isDark ? AppColors.darkPrimary : AppColors.primary)
-                : (isDark ? AppColors.darkBorder : AppColors.border),
-            width: isSelected ? 6 : 1.5,
+  Widget _buildInfoRow(String label, String value, bool isDark) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(
+          label,
+          style: AppTypography.caption.copyWith(
+            color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
           ),
         ),
-      ),
-      onTap: onTap,
+        Text(
+          value,
+          style: AppTypography.bodySmall.copyWith(
+            fontWeight: FontWeight.w600,
+            color: isDark ? AppColors.darkText : AppColors.textPrimary,
+          ),
+        ),
+      ],
     );
   }
 }
-

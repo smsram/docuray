@@ -189,6 +189,14 @@ class SampleDocumentRepository implements DocumentRepository {
   }
 
   @override
+  Future<void> renameFolder(String folderId, String newName) async {
+    final index = _folders.indexWhere((f) => f.id == folderId);
+    if (index >= 0) {
+      _folders[index] = _folders[index].copyWith(name: newName);
+    }
+  }
+
+  @override
   Future<void> deleteFolder(String folderId) async {
     _folders.removeWhere((f) => f.id == folderId);
   }

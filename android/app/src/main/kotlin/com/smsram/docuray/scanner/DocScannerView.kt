@@ -1,4 +1,4 @@
-package com.docuray.docuray.scanner
+package com.smsram.docuray.scanner
 
 import android.app.Activity
 import android.content.Context
@@ -14,6 +14,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.camera.core.*
+import androidx.camera.core.resolutionselector.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -43,7 +44,7 @@ class DocScannerView(
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val previewView = PreviewView(context).apply {
-        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        implementationMode = PreviewView.ImplementationMode.PERFORMANCE
         scaleType = PreviewView.ScaleType.FIT_CENTER
         layoutParams = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
     }
@@ -105,22 +106,50 @@ class DocScannerView(
                 if (isPaused) return@addListener
                 cameraProvider = future.get()
 
-                // Configure all 3 use cases with identical 4:3 target aspect ratio
+                // 1. High-resolution Preview use case (1080p target with 4:3 aspect ratio)
+                val previewResolutionSelector = ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(1440, 1080),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        )
+                    )
+                    .build()
+
                 val preview = Preview.Builder()
-                    .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                    .setResolutionSelector(previewResolutionSelector)
                     .build().also {
                         it.setSurfaceProvider(previewView.surfaceProvider)
                     }
 
+                // 2. Maximum quality ImageCapture using full sensor megapixels
+                val captureResolutionSelector = ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+                    .build()
+
                 imageCapture = ImageCapture.Builder()
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                    .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                    .setResolutionSelector(captureResolutionSelector)
+                    .setJpegQuality(95)
+                    .build()
+
+                // 3. Independent ImageAnalysis stream targeting 640x480 for real-time document detection
+                val analysisResolutionSelector = ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(640, 480),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+                        )
+                    )
                     .build()
 
                 val imageAnalyzer = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                    .setTargetResolution(Size(640, 480))
+                    .setResolutionSelector(analysisResolutionSelector)
                     .build().also { analyzer ->
                         analyzer.setAnalyzer(cameraExecutor) { proxy ->
                             processImageFrame(proxy)

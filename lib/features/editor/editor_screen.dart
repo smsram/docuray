@@ -9,8 +9,12 @@ import '../../core/providers/documents_provider.dart';
 import '../../core/providers/scanner_provider.dart';
 import '../../core/providers/settings_provider.dart';
 import '../../core/services/pdf_generator_service.dart';
+import '../../core/services/google_drive_service.dart';
 import '../../core/routing/app_router.dart';
 import '../../core/widgets/document_thumbnail.dart';
+import '../../models/models.dart';
+import 'widgets/editor_preview_overlay.dart';
+import 'widgets/editor_tool_panels.dart';
 
 /// Screen 6: Scan Result / Document Editor with real 4-point perspective warp preview,
 /// draggable corners and edge handles, professional filters, adjustments, multi-page reordering,
@@ -25,21 +29,11 @@ class EditorScreen extends StatefulWidget {
 }
 
 class _EditorScreenState extends State<EditorScreen> {
-  double _brightness = 0.0;
-  double _contrast = 0.0;
-  double _sharpness = 0.0;
-
-  /// Sync slider values from the current page's stored adjustments.
-  void _syncSlidersFromPage(EditorProvider editor) {
-    final page = editor.currentPage;
-    if (page != null) {
-      setState(() {
-        _brightness = page.brightness;
-        _contrast = page.contrast;
-        _sharpness = page.sharpness;
-      });
-    }
-  }
+  final ScrollController _toolbarScrollController = ScrollController();
+  double _eraseBrushSize = 15.0;
+  AnnotationType _activeAnnotationType = AnnotationType.pen;
+  Color _activeAnnotationColor = const Color(0xFFFF0000);
+  double _activeAnnotationStrokeWidth = 3.0;
 
   @override
   void initState() {
@@ -51,10 +45,18 @@ class _EditorScreenState extends State<EditorScreen> {
       if (widget.documentId != null) {
         final doc = docsProvider.getDocument(widget.documentId!);
         if (doc != null) {
-          editor.initializeWithPages(doc.pages, title: doc.title);
+          editor.initializeWithPages(
+            doc.pages,
+            title: doc.title,
+            documentId: doc.id,
+            existingPdfPath: doc.pdfPath,
+          );
         }
+      } else if (editor.pages.isEmpty && mounted) {
+        // Discard stale or invalid navigation to editor without pages
+        context.go(AppRouter.home);
+        return;
       }
-      _syncSlidersFromPage(editor);
 
       final page = editor.currentPage;
       if (page != null && page.autoDetectedCorners == null && mounted) {
@@ -71,6 +73,7 @@ class _EditorScreenState extends State<EditorScreen> {
 
   @override
   void dispose() {
+    _toolbarScrollController.dispose();
     super.dispose();
   }
 
@@ -97,7 +100,9 @@ class _EditorScreenState extends State<EditorScreen> {
     );
 
     if (leave == true && mounted) {
+      await editor.discardRecoveryDraft();
       editor.clearPages();
+      if (!mounted) return;
       context.go(AppRouter.home);
     }
   }
@@ -110,22 +115,28 @@ class _EditorScreenState extends State<EditorScreen> {
       return;
     }
 
+    if (editor.isSaving) return;
+
     final settings = context.read<SettingsProvider>();
     final initialQuality = PdfExportQuality.fromString(settings.defaultPdfQuality);
 
     // Prompt user with Export Quality selector (Small, Standard, High)
-    final selectedQuality = await showModalBottomSheet<PdfExportQuality>(
+    final selection = await showModalBottomSheet<_ExportSelection>(
       context: context,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      builder: (ctx) => _ExportQualitySheet(initialQuality: initialQuality),
+      builder: (ctx) => _ExportQualitySheet(
+        initialQuality: initialQuality,
+        isEditingExisting: editor.isEditingExisting,
+      ),
     );
 
-    if (selectedQuality == null || !mounted) return;
+    if (selection == null || !mounted) return;
 
     final docsProvider = context.read<DocumentsProvider>();
 
+    var dialogDismissed = false;
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -138,7 +149,7 @@ class _EditorScreenState extends State<EditorScreen> {
               children: [
                 const CircularProgressIndicator(),
                 const SizedBox(height: 16),
-                Text('Saving PDF (${selectedQuality.label})...'),
+                Text('Saving PDF (${selection.quality.label})...'),
               ],
             ),
           ),
@@ -147,11 +158,17 @@ class _EditorScreenState extends State<EditorScreen> {
     );
 
     try {
-      final savedDoc = await editor.saveDocument(exportQuality: selectedQuality);
+      final savedDoc = await editor.saveDocument(
+        exportQuality: selection.quality,
+        saveAsCopy: selection.saveAsCopy,
+      );
       await docsProvider.loadData();
 
       if (mounted) {
-        Navigator.of(context, rootNavigator: true).pop(); // dismiss loading dialog
+        if (!dialogDismissed) {
+          dialogDismissed = true;
+          Navigator.of(context, rootNavigator: true).pop(); // dismiss loading dialog safely
+        }
         final sizeText = editor.lastExportSizeFormatted;
         final msg = sizeText.isNotEmpty
             ? 'Saved "${savedDoc.title}" ($sizeText)'
@@ -163,11 +180,27 @@ class _EditorScreenState extends State<EditorScreen> {
             backgroundColor: AppColors.success,
           ),
         );
-        context.go('/viewer/${savedDoc.id}');
+
+        // Automatic Google Drive backup if configured and enabled
+        final settings = context.read<SettingsProvider>();
+        if (settings.isDriveConnected && settings.driveAutoBackup) {
+          GoogleDriveService.instance.backupSingleDocument(
+            savedDoc,
+            wifiOnly: settings.driveWifiOnly,
+            includeMetadata: settings.driveIncludeMetadata,
+          ).then((_) {
+            docsProvider.loadData();
+          }).catchError((_) {});
+        }
+        // Use push to maintain the editor on the back stack
+        context.push('/viewer/${savedDoc.id}');
       }
     } catch (e) {
       if (mounted) {
-        Navigator.of(context, rootNavigator: true).pop();
+        if (!dialogDismissed) {
+          dialogDismissed = true;
+          Navigator.of(context, rootNavigator: true).pop();
+        }
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Failed to save document: $e'),
@@ -270,6 +303,26 @@ class _EditorScreenState extends State<EditorScreen> {
                                   icon: const Icon(Icons.auto_awesome_rounded, size: 14),
                                   label: const Text('Auto Crop'),
                                   onPressed: editor.resetCrop,
+                                ),
+                                const SizedBox(width: 6),
+                                ElevatedButton.icon(
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.black87,
+                                    foregroundColor: Colors.white,
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                    textStyle: AppTypography.badge,
+                                  ),
+                                  icon: const Icon(Icons.open_with_rounded, size: 14),
+                                  label: const Text('Manual Crop'),
+                                  onPressed: () {
+                                    // Manual corner dragging is enabled
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(
+                                        content: Text('Drag the corner handles or edge midpoints to adjust crop.'),
+                                        duration: Duration(seconds: 2),
+                                      ),
+                                    );
+                                  },
                                 ),
                                 const SizedBox(width: 6),
                                 ElevatedButton.icon(
@@ -387,16 +440,14 @@ class _EditorScreenState extends State<EditorScreen> {
             ),
           ),
 
-          // 2. Active Tool Drawer / Panel (Filter or Adjust)
-          if (editor.activeTool == EditorActiveTool.filter)
-            _buildFilterPanel(editor, isDark)
-          else if (editor.activeTool == EditorActiveTool.adjust)
-            _buildAdjustPanel(editor, isDark),
+          // 2. Active Tool Drawer / Panel
+          if (_buildActiveToolDrawer(editor, isDark) != null)
+            _buildActiveToolDrawer(editor, isDark)!,
 
           // 3. Multi-Page Thumbnail Strip & Add Page CTA
           _buildMultiPageStrip(editor, isDark),
 
-          // 4. Bottom Toolbar (Crop, Rotate, Filter, Adjust, Retake)
+          // 4. Bottom Toolbar (16 tools in exact order)
           _buildBottomToolbar(editor, isDark),
         ],
       ),
@@ -523,6 +574,24 @@ class _EditorScreenState extends State<EditorScreen> {
     // In standard / filter / adjust mode: show warped & enhanced preview
     final previewBytes = editor.displayedPreviewBytes;
     if (previewBytes != null) {
+      final turns = ((page?.rotationDegrees ?? 0) ~/ 90) % 4;
+      final rawAspect = (page?.aspectRatio != null && page!.aspectRatio > 0)
+          ? page.aspectRatio
+          : 0.707;
+      final pageAspect = (turns % 2 == 1) ? (1.0 / rawAspect) : rawAspect;
+      final maxW = constraints.maxWidth * 0.92;
+      final maxH = constraints.maxHeight * 0.94;
+      final boxAspect = maxW / maxH;
+
+      double renderW, renderH;
+      if (pageAspect > boxAspect) {
+        renderW = maxW;
+        renderH = maxW / pageAspect;
+      } else {
+        renderH = maxH;
+        renderW = maxH * pageAspect;
+      }
+
       return Container(
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(8),
@@ -536,11 +605,33 @@ class _EditorScreenState extends State<EditorScreen> {
         ),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(8),
-          child: Image.memory(
-            previewBytes,
-            fit: BoxFit.contain,
-            width: constraints.maxWidth * 0.92,
-            height: constraints.maxHeight * 0.94,
+          child: SizedBox(
+            width: renderW,
+            height: renderH,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                RotatedBox(
+                  quarterTurns: turns,
+                  child: Image.memory(
+                    previewBytes,
+                    fit: BoxFit.fill,
+                    width: renderW,
+                    height: renderH,
+                  ),
+                ),
+                if (page != null)
+                  EditorPreviewOverlay(
+                    editor: editor,
+                    page: page,
+                    size: Size(renderW, renderH),
+                    eraseBrushSize: _eraseBrushSize,
+                    activeAnnotationType: _activeAnnotationType,
+                    activeAnnotationColor: _activeAnnotationColor,
+                    activeAnnotationStrokeWidth: _activeAnnotationStrokeWidth,
+                  ),
+              ],
+            ),
           ),
         ),
       );
@@ -559,191 +650,56 @@ class _EditorScreenState extends State<EditorScreen> {
     );
   }
 
-  // Filter Selection Panel with all 6 Professional Document Filters
-  Widget _buildFilterPanel(EditorProvider editor, bool isDark) {
-    final filters = [
-      {'id': 'original', 'name': 'Original'},
-      {'id': 'auto', 'name': 'Auto-Color'},
-      {'id': 'light_text', 'name': 'Light Text'},
-      {'id': 'grayscale', 'name': 'Grayscale'},
-      {'id': 'whiteboard', 'name': 'Whiteboard'},
-      {'id': 'bw', 'name': 'B&W'},
-    ];
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      decoration: BoxDecoration(
-        color: isDark ? AppColors.darkSurface : Colors.white,
-        border: Border(
-          top: BorderSide(color: isDark ? AppColors.darkBorder : AppColors.border),
-        ),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                'DOCUMENT FILTERS',
-                style: AppTypography.badge.copyWith(
-                  color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
-                  letterSpacing: 1.0,
-                ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.close_rounded, size: 18),
-                onPressed: () => editor.setActiveTool(EditorActiveTool.none),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: filters.map((f) {
-                final currentFilter = editor.currentPage?.filterType.toLowerCase() ?? 'auto';
-                final isSelected = currentFilter == f['id'] ||
-                    (f['id'] == 'auto' && (currentFilter == 'auto' || currentFilter == 'color'));
-                return Padding(
-                  padding: const EdgeInsets.only(right: 10),
-                  child: InkWell(
-                    onTap: () => editor.setFilter(f['id']!),
-                    borderRadius: BorderRadius.circular(10),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                      decoration: BoxDecoration(
-                        color: isSelected
-                            ? (isDark ? AppColors.darkPrimary : AppColors.primary)
-                            : (isDark ? const Color(0xFF262C34) : const Color(0xFFF1F5F9)),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Text(
-                        f['name']!,
-                        style: AppTypography.buttonSmall.copyWith(
-                          color: isSelected
-                              ? (isDark ? const Color(0xFF0F172A) : Colors.white)
-                              : (isDark ? AppColors.darkText : AppColors.textPrimary),
-                          fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
-                        ),
-                      ),
-                    ),
-                  ),
-                );
-              }).toList(),
-            ),
-          ),
-        ],
-      ),
-    );
+  // Active Tool Drawer / Panel dispatcher
+  Widget? _buildActiveToolDrawer(EditorProvider editor, bool isDark) {
+    switch (editor.activeTool) {
+      case EditorActiveTool.rotate:
+        return RotateToolPanel(editor: editor);
+      case EditorActiveTool.filter:
+        return FilterToolPanel(editor: editor);
+      case EditorActiveTool.adjust:
+        return AdjustToolPanel(editor: editor);
+      case EditorActiveTool.erase:
+        return EraseToolPanel(
+          editor: editor,
+          brushSize: _eraseBrushSize,
+          onBrushSizeChanged: (v) => setState(() => _eraseBrushSize = v),
+        );
+      case EditorActiveTool.annotate:
+        return AnnotateToolPanel(
+          editor: editor,
+          activeType: _activeAnnotationType,
+          activeColor: _activeAnnotationColor,
+          strokeWidth: _activeAnnotationStrokeWidth,
+          onTypeChanged: (t) => setState(() => _activeAnnotationType = t),
+          onColorChanged: (c) => setState(() => _activeAnnotationColor = c),
+          onStrokeWidthChanged: (w) => setState(() => _activeAnnotationStrokeWidth = w),
+          onAddText: () => _showAddTextDialog(editor),
+          onAddSignature: () => _showAddSignatureDialog(editor),
+        );
+      case EditorActiveTool.watermark:
+        return WatermarkToolPanel(editor: editor);
+      case EditorActiveTool.redact:
+        return RedactToolPanel(editor: editor);
+      case EditorActiveTool.resize:
+        return ResizeToolPanel(editor: editor);
+      case EditorActiveTool.margins:
+        return MarginsToolPanel(editor: editor);
+      case EditorActiveTool.border:
+        return BorderToolPanel(editor: editor);
+      case EditorActiveTool.reorder:
+        return ReorderToolPanel(editor: editor);
+      case EditorActiveTool.none:
+      case EditorActiveTool.crop:
+      case EditorActiveTool.retake:
+      case EditorActiveTool.undo:
+      case EditorActiveTool.redo:
+      case EditorActiveTool.reset:
+        return null;
+    }
   }
 
-  // Adjustments Panel (Brightness, Contrast, Sharpness)
-  Widget _buildAdjustPanel(EditorProvider editor, bool isDark) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      decoration: BoxDecoration(
-        color: isDark ? AppColors.darkSurface : Colors.white,
-        border: Border(
-          top: BorderSide(color: isDark ? AppColors.darkBorder : AppColors.border),
-        ),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                'ADJUSTMENTS',
-                style: AppTypography.badge.copyWith(
-                  color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
-                  letterSpacing: 1.0,
-                ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.close_rounded, size: 18),
-                onPressed: () => editor.setActiveTool(EditorActiveTool.none),
-              ),
-            ],
-          ),
-          // Brightness Slider
-          Row(
-            children: [
-              const Icon(Icons.brightness_6_rounded, size: 16),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Slider(
-                  value: _brightness,
-                  min: -0.5,
-                  max: 0.5,
-                  activeColor: isDark ? AppColors.darkPrimary : AppColors.primary,
-                  onChanged: (v) {
-                    setState(() => _brightness = v);
-                    editor.setAdjustments(brightness: v);
-                  },
-                ),
-              ),
-              Text(
-                '${(_brightness * 100).toInt()}%',
-                style: AppTypography.badge,
-              ),
-            ],
-          ),
-          // Contrast Slider
-          Row(
-            children: [
-              const Icon(Icons.contrast_rounded, size: 16),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Slider(
-                  value: _contrast,
-                  min: -0.5,
-                  max: 0.5,
-                  activeColor: isDark ? AppColors.darkPrimary : AppColors.primary,
-                  onChanged: (v) {
-                    setState(() => _contrast = v);
-                    editor.setAdjustments(contrast: v);
-                  },
-                ),
-              ),
-              Text(
-                '${(_contrast * 100).toInt()}%',
-                style: AppTypography.badge,
-              ),
-            ],
-          ),
-          // Sharpness Slider
-          Row(
-            children: [
-              const Icon(Icons.details_rounded, size: 16),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Slider(
-                  value: _sharpness,
-                  min: 0.0,
-                  max: 1.0,
-                  activeColor: isDark ? AppColors.darkPrimary : AppColors.primary,
-                  onChanged: (v) {
-                    setState(() => _sharpness = v);
-                    editor.setAdjustments(sharpness: v);
-                  },
-                ),
-              ),
-              Text(
-                '${(_sharpness * 100).toInt()}%',
-                style: AppTypography.badge,
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  // Multi-Page Thumbnail Strip
+  // Multi-Page Thumbnail Strip & Add Page CTA
   Widget _buildMultiPageStrip(EditorProvider editor, bool isDark) {
     return Container(
       height: 90,
@@ -772,7 +728,6 @@ class _EditorScreenState extends State<EditorScreen> {
                       GestureDetector(
                         onTap: () {
                           editor.setPageIndex(index);
-                          _syncSlidersFromPage(editor);
                         },
                         child: Container(
                           width: 48,
@@ -881,10 +836,9 @@ class _EditorScreenState extends State<EditorScreen> {
     );
   }
 
-  // Bottom Toolbar: Crop, Rotate, Filter, Adjust, Retake
+  // Bottom Toolbar: exactly 16 functional editing tools in strict specified order
   Widget _buildBottomToolbar(EditorProvider editor, bool isDark) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
         color: isDark ? AppColors.darkSurface : Colors.white,
         border: Border(
@@ -893,45 +847,165 @@ class _EditorScreenState extends State<EditorScreen> {
       ),
       child: SafeArea(
         top: false,
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceAround,
-          children: [
-            _buildToolbarItem(
-              icon: Icons.crop_rounded,
-              label: 'Crop',
-              isActive: editor.activeTool == EditorActiveTool.crop,
-              onTap: () => editor.setActiveTool(EditorActiveTool.crop),
-              isDark: isDark,
+        child: SizedBox(
+          height: 64,
+          child: SingleChildScrollView(
+            controller: _toolbarScrollController,
+            scrollDirection: Axis.horizontal,
+            physics: const BouncingScrollPhysics(),
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            child: Row(
+              children: [
+                // 1. Crop
+                _buildToolbarItem(
+                  icon: Icons.crop_rounded,
+                  label: 'Crop',
+                  isActive: editor.activeTool == EditorActiveTool.crop,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.crop),
+                  isDark: isDark,
+                ),
+                // 2. Rotate
+                _buildToolbarItem(
+                  icon: Icons.rotate_right_rounded,
+                  label: 'Rotate',
+                  isActive: editor.activeTool == EditorActiveTool.rotate,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.rotate),
+                  isDark: isDark,
+                ),
+                // 3. Filter
+                _buildToolbarItem(
+                  icon: Icons.filter_b_and_w_rounded,
+                  label: 'Filter',
+                  isActive: editor.activeTool == EditorActiveTool.filter,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.filter),
+                  isDark: isDark,
+                ),
+                // 4. Adjust
+                _buildToolbarItem(
+                  icon: Icons.tune_rounded,
+                  label: 'Adjust',
+                  isActive: editor.activeTool == EditorActiveTool.adjust,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.adjust),
+                  isDark: isDark,
+                ),
+                // 5. Retake
+                _buildToolbarItem(
+                  icon: Icons.replay_rounded,
+                  label: 'Retake',
+                  isActive: false,
+                  isEnabled: true,
+                  onTap: () {
+                    editor.startRetake(editor.currentPageIndex);
+                    context.push(AppRouter.scanner);
+                  },
+                  isDark: isDark,
+                ),
+                // 6. Erase
+                _buildToolbarItem(
+                  icon: Icons.auto_fix_normal_rounded,
+                  label: 'Erase',
+                  isActive: editor.activeTool == EditorActiveTool.erase,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.erase),
+                  isDark: isDark,
+                ),
+                // 7. Annotate
+                _buildToolbarItem(
+                  icon: Icons.edit_note_rounded,
+                  label: 'Annotate',
+                  isActive: editor.activeTool == EditorActiveTool.annotate,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.annotate),
+                  isDark: isDark,
+                ),
+                // 8. Watermark
+                _buildToolbarItem(
+                  icon: Icons.branding_watermark_outlined,
+                  label: 'Watermark',
+                  isActive: editor.activeTool == EditorActiveTool.watermark,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.watermark),
+                  isDark: isDark,
+                ),
+                // 9. Redact
+                _buildToolbarItem(
+                  icon: Icons.security_rounded,
+                  label: 'Redact',
+                  isActive: editor.activeTool == EditorActiveTool.redact,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.redact),
+                  isDark: isDark,
+                ),
+                // 10. Resize
+                _buildToolbarItem(
+                  icon: Icons.aspect_ratio_rounded,
+                  label: 'Resize',
+                  isActive: editor.activeTool == EditorActiveTool.resize,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.resize),
+                  isDark: isDark,
+                ),
+                // 11. Margins
+                _buildToolbarItem(
+                  icon: Icons.crop_square_rounded,
+                  label: 'Margins',
+                  isActive: editor.activeTool == EditorActiveTool.margins,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.margins),
+                  isDark: isDark,
+                ),
+                // 12. Border
+                _buildToolbarItem(
+                  icon: Icons.border_outer_rounded,
+                  label: 'Border',
+                  isActive: editor.activeTool == EditorActiveTool.border,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.border),
+                  isDark: isDark,
+                ),
+                // 13. Reorder
+                _buildToolbarItem(
+                  icon: Icons.swap_horiz_rounded,
+                  label: 'Reorder',
+                  isActive: editor.activeTool == EditorActiveTool.reorder,
+                  isEnabled: true,
+                  onTap: () => editor.setActiveTool(EditorActiveTool.reorder),
+                  isDark: isDark,
+                ),
+                // 14. Undo
+                _buildToolbarItem(
+                  icon: Icons.undo_rounded,
+                  label: 'Undo',
+                  isActive: false,
+                  isEnabled: editor.canUndo,
+                  onTap: editor.canUndo ? editor.undo : () {},
+                  isDark: isDark,
+                ),
+                // 15. Redo
+                _buildToolbarItem(
+                  icon: Icons.redo_rounded,
+                  label: 'Redo',
+                  isActive: false,
+                  isEnabled: editor.canRedo,
+                  onTap: editor.canRedo ? editor.redo : () {},
+                  isDark: isDark,
+                ),
+                // 16. Reset
+                _buildToolbarItem(
+                  icon: Icons.restart_alt_rounded,
+                  label: 'Reset',
+                  isActive: false,
+                  isEnabled: true,
+                  onTap: () => _confirmResetCurrentPage(editor),
+                  isDark: isDark,
+                ),
+              ],
             ),
-            _buildToolbarItem(
-              icon: Icons.rotate_right_rounded,
-              label: 'Rotate',
-              isActive: false,
-              onTap: editor.rotateCurrentPage,
-              isDark: isDark,
-            ),
-            _buildToolbarItem(
-              icon: Icons.filter_b_and_w_rounded,
-              label: 'Filter',
-              isActive: editor.activeTool == EditorActiveTool.filter,
-              onTap: () => editor.setActiveTool(EditorActiveTool.filter),
-              isDark: isDark,
-            ),
-            _buildToolbarItem(
-              icon: Icons.tune_rounded,
-              label: 'Adjust',
-              isActive: editor.activeTool == EditorActiveTool.adjust,
-              onTap: () => editor.setActiveTool(EditorActiveTool.adjust),
-              isDark: isDark,
-            ),
-            _buildToolbarItem(
-              icon: Icons.replay_rounded,
-              label: 'Retake',
-              isActive: false,
-              onTap: () => context.push(AppRouter.scanner),
-              isDark: isDark,
-            ),
-          ],
+          ),
         ),
       ),
     );
@@ -941,28 +1015,46 @@ class _EditorScreenState extends State<EditorScreen> {
     required IconData icon,
     required String label,
     required bool isActive,
+    required bool isEnabled,
     required VoidCallback onTap,
     required bool isDark,
   }) {
-    final color = isActive
-        ? (isDark ? AppColors.darkPrimary : AppColors.primary)
-        : (isDark ? AppColors.darkText : AppColors.textPrimary);
+    final activeColor = isDark ? AppColors.darkPrimary : AppColors.primary;
+    final inactiveColor = isDark ? AppColors.darkText : AppColors.textPrimary;
+    final disabledColor = (isDark ? Colors.white : Colors.black).withAlpha(60);
+
+    final color = !isEnabled
+        ? disabledColor
+        : (isActive ? activeColor : inactiveColor);
 
     return InkWell(
-      onTap: onTap,
+      onTap: isEnabled ? onTap : null,
       borderRadius: BorderRadius.circular(8),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        margin: const EdgeInsets.symmetric(horizontal: 2),
+        decoration: BoxDecoration(
+          color: isActive
+              ? (isDark ? AppColors.darkPrimary.withAlpha(35) : AppColors.primary.withAlpha(20))
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: isActive ? activeColor.withAlpha(100) : Colors.transparent,
+            width: 1.0,
+          ),
+        ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(icon, size: 22, color: color),
+            Icon(icon, size: 20, color: color),
             const SizedBox(height: 3),
             Text(
               label,
               style: AppTypography.badge.copyWith(
                 color: color,
-                fontWeight: isActive ? FontWeight.w700 : FontWeight.w500,
+                fontWeight: isActive ? FontWeight.w700 : (isEnabled ? FontWeight.w500 : FontWeight.w400),
+                fontSize: 10,
               ),
             ),
           ],
@@ -970,13 +1062,195 @@ class _EditorScreenState extends State<EditorScreen> {
       ),
     );
   }
+
+  Future<void> _confirmResetCurrentPage(EditorProvider editor) async {
+    final pageNum = editor.currentPageIndex + 1;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Reset Page $pageNum?'),
+        content: const Text(
+          'This will revert all crop, rotation, filters, adjustments, annotations, erase marks, watermark, redactions, size, margins, and borders on this page back to the original scan.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: AppColors.error),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Reset Page'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true && mounted) {
+      editor.resetCurrentPage();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Page $pageNum reset to original'),
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  Future<void> _showAddTextDialog(EditorProvider editor) async {
+    final controller = TextEditingController();
+    final text = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Add Text Annotation'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'Text',
+            hintText: 'Enter annotation text...',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, null), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, controller.text.trim()), child: const Text('Add')),
+        ],
+      ),
+    );
+    if (text != null && text.isNotEmpty) {
+      editor.addAnnotation(
+        AnnotationElement(
+          id: 'ann_${DateTime.now().microsecondsSinceEpoch}',
+          type: AnnotationType.text,
+          points: const [Offset(0.2, 0.4)],
+          text: text,
+          colorValue: _activeAnnotationColor.toARGB32(),
+          fontSize: 20.0,
+        ),
+      );
+    }
+  }
+
+  Future<void> _showAddSignatureDialog(EditorProvider editor) async {
+    final sigPoints = await showDialog<List<Offset>>(
+      context: context,
+      builder: (ctx) => const _SignatureDrawDialog(),
+    );
+    if (sigPoints != null && sigPoints.isNotEmpty) {
+      editor.addAnnotation(
+        AnnotationElement(
+          id: 'sig_${DateTime.now().microsecondsSinceEpoch}',
+          type: AnnotationType.pen,
+          points: sigPoints,
+          colorValue: Colors.black.toARGB32(),
+          strokeWidth: 3.5,
+        ),
+      );
+    }
+  }
+}
+
+class _SignatureDrawDialog extends StatefulWidget {
+  const _SignatureDrawDialog();
+
+  @override
+  State<_SignatureDrawDialog> createState() => _SignatureDrawDialogState();
+}
+
+class _SignatureDrawDialogState extends State<_SignatureDrawDialog> {
+  final List<Offset> _points = [];
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Draw Signature'),
+      content: SizedBox(
+        width: 280,
+        height: 180,
+        child: Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            border: Border.all(color: Colors.grey.shade400),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: GestureDetector(
+            onPanUpdate: (details) {
+              setState(() {
+                _points.add(details.localPosition);
+              });
+            },
+            child: CustomPaint(
+              painter: _SigPainter(_points),
+              size: const Size(280, 180),
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => setState(() => _points.clear()),
+          child: const Text('Clear'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.pop(context, null),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _points.isEmpty
+              ? null
+              : () {
+                  final norm = _points
+                      .map((p) => Offset((p.dx / 280.0) * 0.4 + 0.3, (p.dy / 180.0) * 0.2 + 0.7))
+                      .toList();
+                  Navigator.pop(context, norm);
+                },
+          child: const Text('Insert'),
+        ),
+      ],
+    );
+  }
+}
+
+class _SigPainter extends CustomPainter {
+  final List<Offset> points;
+  _SigPainter(this.points);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.black
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round
+      ..strokeWidth = 3.0;
+
+    for (int i = 0; i < points.length - 1; i++) {
+      if ((points[i] - points[i + 1]).distance < 30) {
+        canvas.drawLine(points[i], points[i + 1], paint);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
+
+class _ExportSelection {
+  final PdfExportQuality quality;
+  final bool saveAsCopy;
+  const _ExportSelection({required this.quality, this.saveAsCopy = false});
 }
 
 /// Modal Sheet for selecting PDF Export Quality (Small, Standard, High)
 class _ExportQualitySheet extends StatefulWidget {
   final PdfExportQuality initialQuality;
+  final bool isEditingExisting;
 
-  const _ExportQualitySheet({required this.initialQuality});
+  const _ExportQualitySheet({
+    required this.initialQuality,
+    this.isEditingExisting = false,
+  });
 
   @override
   State<_ExportQualitySheet> createState() => _ExportQualitySheetState();
@@ -1014,7 +1288,7 @@ class _ExportQualitySheetState extends State<_ExportQualitySheet> {
             ),
             const SizedBox(height: 16),
             Text(
-              'PDF Export Quality',
+              widget.isEditingExisting ? 'Save Document Changes' : 'PDF Export Quality',
               style: AppTypography.sectionTitle.copyWith(
                 color: isDark ? AppColors.darkText : AppColors.textPrimary,
               ),
@@ -1046,18 +1320,51 @@ class _ExportQualitySheetState extends State<_ExportQualitySheet> {
               isDark: isDark,
             ),
             const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: FilledButton(
-                style: FilledButton.styleFrom(
-                  backgroundColor: isDark ? AppColors.darkPrimary : AppColors.primary,
-                  foregroundColor: isDark ? const Color(0xFF0F172A) : Colors.white,
+            if (widget.isEditingExisting) ...[
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: isDark ? AppColors.darkPrimary : AppColors.primary,
+                    foregroundColor: isDark ? const Color(0xFF0F172A) : Colors.white,
+                  ),
+                  onPressed: () => Navigator.pop(
+                    context,
+                    _ExportSelection(quality: _selected, saveAsCopy: false),
+                  ),
+                  child: const Text('Update Existing Document', style: TextStyle(fontWeight: FontWeight.bold)),
                 ),
-                onPressed: () => Navigator.pop(context, _selected),
-                child: const Text('Export Document', style: TextStyle(fontWeight: FontWeight.bold)),
               ),
-            ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                height: 44,
+                child: OutlinedButton(
+                  onPressed: () => Navigator.pop(
+                    context,
+                    _ExportSelection(quality: _selected, saveAsCopy: true),
+                  ),
+                  child: const Text('Save as New Copy'),
+                ),
+              ),
+            ] else ...[
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: isDark ? AppColors.darkPrimary : AppColors.primary,
+                    foregroundColor: isDark ? const Color(0xFF0F172A) : Colors.white,
+                  ),
+                  onPressed: () => Navigator.pop(
+                    context,
+                    _ExportSelection(quality: _selected, saveAsCopy: false),
+                  ),
+                  child: const Text('Export Document', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+              ),
+            ],
           ],
         ),
       ),

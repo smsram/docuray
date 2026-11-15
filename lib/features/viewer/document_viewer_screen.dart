@@ -9,6 +9,7 @@ import '../../core/widgets/document_thumbnail.dart';
 import '../../core/widgets/empty_state.dart';
 import '../../core/widgets/loading_state.dart';
 import '../../core/widgets/app_buttons.dart';
+import '../../core/routing/app_router.dart';
 import 'document_more_sheet.dart';
 import '../share/share_export_sheet.dart';
 
@@ -56,8 +57,9 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
       return Scaffold(
         appBar: AppBar(
           leading: IconButton(
-            icon: const Icon(Icons.arrow_back_rounded),
-            onPressed: () => context.pop(),
+            icon: const Icon(Icons.home_rounded),
+            tooltip: 'Home',
+            onPressed: () => context.go(AppRouter.home),
           ),
           title: const Text('Document not found'),
         ),
@@ -66,21 +68,28 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
           title: 'Document not found',
           description: 'This document may have been deleted or moved.',
           buttonLabel: 'Back to Home',
-          onButtonPressed: () => context.go('/home'),
+          onButtonPressed: () => context.go(AppRouter.home),
         ),
       );
     }
 
     final pages = document.pages;
 
-    return Scaffold(
-      backgroundColor: isDark ? AppColors.darkBackground : AppColors.background,
-      appBar: AppBar(
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_rounded),
-          onPressed: () => context.pop(),
-          tooltip: 'Back',
-        ),
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) {
+          context.go(AppRouter.home);
+        }
+      },
+      child: Scaffold(
+        backgroundColor: isDark ? AppColors.darkBackground : AppColors.background,
+        appBar: AppBar(
+          leading: IconButton(
+            icon: const Icon(Icons.home_rounded),
+            onPressed: () => context.go(AppRouter.home),
+            tooltip: 'Home',
+          ),
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -293,18 +302,15 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
                   ),
                   const SizedBox(width: 10),
 
-                  // Future AI Action Button (Coming in Phase 2)
+                  // Contextual AI Assistant
                   Expanded(
                     flex: 1,
                     child: AIActionButton(
                       label: 'Ask AI',
                       onPressed: () {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text('AI Assistant will be available in the upcoming AI update.'),
-                            duration: Duration(seconds: 2),
-                            behavior: SnackBarBehavior.floating,
-                          ),
+                        context.push(
+                          '/viewer/${widget.documentId}/ai',
+                          extra: {'pageIndex': _currentPageIndex},
                         );
                       },
                     ),
@@ -315,6 +321,7 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
           ),
         ],
       ),
-    );
-  }
+    ),
+  );
+}
 }

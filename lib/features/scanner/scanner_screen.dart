@@ -8,6 +8,7 @@ import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_typography.dart';
 import '../../core/providers/scanner_provider.dart';
 import '../../core/providers/editor_provider.dart';
+import '../../core/providers/settings_provider.dart';
 import '../../core/routing/app_router.dart';
 import '../../core/widgets/app_buttons.dart';
 import '../../core/services/native_scanner_service.dart';
@@ -22,8 +23,9 @@ class ScannerScreen extends StatefulWidget {
 }
 
 class _ScannerScreenState extends State<ScannerScreen>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, RouteAware {
   bool _isNavigating = false;
+  bool _isImportingGallery = false;
 
   @override
   void initState() {
@@ -32,21 +34,33 @@ class _ScannerScreenState extends State<ScannerScreen>
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final scanner = context.read<ScannerProvider>();
+      final settings = context.read<SettingsProvider>();
+      scanner.setAutoCapture(settings.autoCaptureDefault);
+      scanner.setAutoCrop(settings.autoCropDefault);
+
       scanner.onAutoCaptured = (capturedPage) async {
         if (!mounted || _isNavigating) return;
         _isNavigating = true;
 
-        // Immediately pause camera and release active camera resources
-        await scanner.pauseCamera();
+        // Immediately stop and dispose hardware camera session
+        await scanner.stopAndDisposeCamera();
 
         if (!mounted) return;
         final editor = context.read<EditorProvider>();
+        if (editor.isRetaking && editor.retakePageIndex != null) {
+          editor.replacePageWithCapture(editor.retakePageIndex!, capturedPage);
+          _isNavigating = false;
+          if (mounted) {
+            context.pop();
+          }
+          return;
+        }
         editor.addPage(capturedPage);
 
         await context.push(AppRouter.editor);
         _isNavigating = false;
         if (mounted) {
-          await scanner.resumeCamera();
+          await scanner.initializeCamera();
         }
       };
 
@@ -55,20 +69,58 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route != null) {
+      AppRouter.routeObserver.subscribe(this, route);
+    }
+  }
+
+  @override
+  void didPushNext() {
+    // Navigating forward to another screen (e.g. editor, settings)
+    try {
+      context.read<ScannerProvider>().stopAndDisposeCamera();
+    } catch (_) {}
+  }
+
+  @override
+  void didPopNext() {
+    // Returned back to the scanner screen
+    if (!_isNavigating && !_isImportingGallery) {
+      try {
+        context.read<ScannerProvider>().initializeCamera();
+      } catch (_) {}
+    }
+  }
+
+  @override
+  void didPop() {
+    try {
+      context.read<ScannerProvider>().stopAndDisposeCamera();
+    } catch (_) {}
+  }
+
+  @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final scanner = context.read<ScannerProvider>();
-    if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
-      scanner.pauseCamera();
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached ||
+        state == AppLifecycleState.hidden) {
+      scanner.stopAndDisposeCamera();
     } else if (state == AppLifecycleState.resumed && !_isNavigating && !_isImportingGallery) {
-      scanner.resumeCamera();
+      scanner.initializeCamera();
     }
   }
 
   @override
   void dispose() {
+    AppRouter.routeObserver.unsubscribe(this);
     WidgetsBinding.instance.removeObserver(this);
     try {
-      context.read<ScannerProvider>().pauseCamera();
+      context.read<ScannerProvider>().stopAndDisposeCamera();
     } catch (_) {}
     super.dispose();
   }
@@ -76,6 +128,15 @@ class _ScannerScreenState extends State<ScannerScreen>
   Future<void> _handleBack() async {
     final scanner = context.read<ScannerProvider>();
     final editor = context.read<EditorProvider>();
+
+    if (editor.isRetaking) {
+      editor.cancelRetake();
+      await scanner.stopAndDisposeCamera();
+      if (mounted) {
+        context.pop();
+      }
+      return;
+    }
 
     if (editor.pages.isNotEmpty) {
       final shouldDiscard = await showDialog<bool>(
@@ -102,14 +163,14 @@ class _ScannerScreenState extends State<ScannerScreen>
       );
 
       if (shouldDiscard == true && mounted) {
-        await scanner.pauseCamera();
+        await scanner.stopAndDisposeCamera();
         editor.clearPages();
         if (mounted) {
           context.go(AppRouter.home);
         }
       }
     } else {
-      await scanner.pauseCamera();
+      await scanner.stopAndDisposeCamera();
       if (mounted) {
         context.go(AppRouter.home);
       }
@@ -125,27 +186,33 @@ class _ScannerScreenState extends State<ScannerScreen>
     final page = await scanner.captureDocument();
     if (page != null && mounted) {
       _isNavigating = true;
-      // Immediately stop camera preview and release active camera resources
-      await scanner.pauseCamera();
+      // Immediately stop and dispose hardware camera session
+      await scanner.stopAndDisposeCamera();
+      if (editor.isRetaking && editor.retakePageIndex != null) {
+        editor.replacePageWithCapture(editor.retakePageIndex!, page);
+        _isNavigating = false;
+        if (mounted) {
+          context.pop();
+        }
+        return;
+      }
       editor.addPage(page);
       if (mounted) {
         await context.push(AppRouter.editor);
         _isNavigating = false;
         if (mounted) {
-          await scanner.resumeCamera();
+          await scanner.initializeCamera();
         }
       }
     }
   }
-
-  bool _isImportingGallery = false;
 
   void _onImportGallery() async {
     if (_isNavigating || _isImportingGallery) return;
     _isImportingGallery = true;
     final scanner = context.read<ScannerProvider>();
     final editor = context.read<EditorProvider>();
-    await scanner.pauseCamera();
+    await scanner.stopAndDisposeCamera();
     try {
       final pages = await scanner.importFromGallery();
       if (pages.isNotEmpty && mounted) {
@@ -161,11 +228,11 @@ class _ScannerScreenState extends State<ScannerScreen>
           await context.push(AppRouter.editor);
           _isNavigating = false;
           if (mounted) {
-            await scanner.resumeCamera();
+            await scanner.initializeCamera();
           }
         }
       } else if (mounted) {
-        await scanner.resumeCamera();
+        await scanner.initializeCamera();
       }
     } finally {
       _isImportingGallery = false;
@@ -183,7 +250,7 @@ class _ScannerScreenState extends State<ScannerScreen>
         child: Column(
           children: [
             // 1. Top Toolbar (Compact, responsive, zero horizontal overflow)
-            _buildTopToolbar(context, scanner),
+            _buildTopToolbar(context, scanner, editor),
 
             // 2. Center Viewfinder Area (Expanded, fits exact 3:4 camera aspect ratio without overflow)
             Expanded(
@@ -259,7 +326,7 @@ class _ScannerScreenState extends State<ScannerScreen>
     );
   }
 
-  Widget _buildTopToolbar(BuildContext context, ScannerProvider scanner) {
+  Widget _buildTopToolbar(BuildContext context, ScannerProvider scanner, EditorProvider editor) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       child: Row(
@@ -272,82 +339,144 @@ class _ScannerScreenState extends State<ScannerScreen>
             tooltip: 'Back',
           ),
 
-          // Two Independent Compact Dropdowns: Capture Type & Capture Mode
-          Flexible(
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Dropdown 1: Capture Type (Document / ID Card)
-                Flexible(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withAlpha(140),
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(color: Colors.white.withAlpha(50)),
-                    ),
-                    child: DropdownButtonHideUnderline(
-                      child: DropdownButton<String>(
-                        value: scanner.captureType,
-                        dropdownColor: const Color(0xFF1E232A),
-                        icon: const Icon(Icons.arrow_drop_down, color: Colors.white, size: 18),
-                        style: AppTypography.buttonSmall.copyWith(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 12,
+          if (editor.isRetaking)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: AppColors.primary,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                'Retaking Page ${(editor.retakePageIndex ?? 0) + 1}',
+                style: AppTypography.buttonSmall.copyWith(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                ),
+              ),
+            )
+          else ...[
+            // Controls: Capture Type, Auto Capture toggle, Auto Crop toggle
+            Flexible(
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Control 1: Capture Type (Document / ID Card)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withAlpha(140),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: Colors.white.withAlpha(50)),
+                      ),
+                      child: DropdownButtonHideUnderline(
+                        child: DropdownButton<String>(
+                          value: scanner.captureType,
+                          dropdownColor: const Color(0xFF1E232A),
+                          icon: const Icon(Icons.arrow_drop_down, color: Colors.white, size: 18),
+                          style: AppTypography.buttonSmall.copyWith(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 12,
+                          ),
+                          isDense: true,
+                          items: const [
+                            DropdownMenuItem(value: 'Document', child: Text('Document')),
+                            DropdownMenuItem(value: 'ID Card', child: Text('ID Card')),
+                          ],
+                          onChanged: (v) {
+                            if (v != null) scanner.setCaptureType(v);
+                          },
                         ),
-                        isDense: true,
-                        items: const [
-                          DropdownMenuItem(value: 'Document', child: Text('Document')),
-                          DropdownMenuItem(value: 'ID Card', child: Text('ID Card')),
-                        ],
-                        onChanged: (v) {
-                          if (v != null) scanner.setCaptureType(v);
-                        },
                       ),
                     ),
-                  ),
-                ),
-                const SizedBox(width: 8),
+                    const SizedBox(width: 6),
 
-                // Dropdown 2: Capture Mode (Auto / Manual)
-                Flexible(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withAlpha(140),
+                    // Control 2: Auto Capture toggle
+                    InkWell(
+                      onTap: scanner.toggleAutoCapture,
                       borderRadius: BorderRadius.circular(16),
-                      border: Border.all(
-                        color: scanner.isAutoCapture
-                            ? AppColors.primary.withAlpha(160)
-                            : Colors.white.withAlpha(50),
-                      ),
-                    ),
-                    child: DropdownButtonHideUnderline(
-                      child: DropdownButton<String>(
-                        value: scanner.captureMode,
-                        dropdownColor: const Color(0xFF1E232A),
-                        icon: const Icon(Icons.arrow_drop_down, color: Colors.white, size: 18),
-                        style: AppTypography.buttonSmall.copyWith(
-                          color: scanner.isAutoCapture ? AppColors.primary : Colors.white,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 12,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: scanner.isAutoCapture
+                              ? AppColors.primary.withAlpha(180)
+                              : Colors.black.withAlpha(140),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: scanner.isAutoCapture
+                                ? AppColors.primary
+                                : Colors.white.withAlpha(50),
+                          ),
                         ),
-                        isDense: true,
-                        items: const [
-                          DropdownMenuItem(value: 'Auto', child: Text('Auto')),
-                          DropdownMenuItem(value: 'Manual', child: Text('Manual')),
-                        ],
-                        onChanged: (v) {
-                          if (v != null) scanner.setCaptureMode(v);
-                        },
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              scanner.isAutoCapture ? Icons.flash_auto_rounded : Icons.touch_app_rounded,
+                              size: 14,
+                              color: Colors.white,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              scanner.isAutoCapture ? 'Capture: Auto' : 'Capture: Manual',
+                              style: AppTypography.buttonSmall.copyWith(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
-                  ),
+                    const SizedBox(width: 6),
+
+                    // Control 3: Auto Crop toggle
+                    InkWell(
+                      onTap: scanner.toggleAutoCrop,
+                      borderRadius: BorderRadius.circular(16),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: scanner.isAutoCrop
+                              ? AppColors.primary.withAlpha(180)
+                              : Colors.black.withAlpha(140),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: scanner.isAutoCrop
+                                ? AppColors.primary
+                                : Colors.white.withAlpha(50),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              scanner.isAutoCrop ? Icons.crop_rounded : Icons.crop_free_rounded,
+                              size: 14,
+                              color: Colors.white,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              scanner.isAutoCrop ? 'Crop: Auto' : 'Crop: Off',
+                              style: AppTypography.buttonSmall.copyWith(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
-          ),
+          ],
 
           // Flash Toggle
           IconButton(
